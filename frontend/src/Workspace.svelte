@@ -6,6 +6,7 @@
   import CursorMore from './CursorMore.svelte';
   import Chart from './Chart.svelte';
   import ProductInitials from './ProductInitials.svelte';
+  import ResponsiveImage from './ResponsiveImage.svelte';
   import Fields, {type Field} from './Fields.svelte';
   let {portal,parts,account}: {portal:string;parts:string[];account:Row}=$props();
   let admin=$derived(portal==='admin');
@@ -119,7 +120,7 @@
 
 {#snippet productRows(list:Row[])}
   <div class="table-scroll"><table><thead><tr><th>Product</th><th>{admin?'Shop':'Lowest price'}</th><th>{admin?'Taxonomy':'Sold / Stock'}</th><th>Status</th><th>{admin?'Created':'Last updated by'}</th><th>Actions</th></tr></thead><tbody>
-  {#each list as row (row.id)}<tr><td><div class="table-item">{#if row.image}<img src={row.image} alt="">{:else}<ProductInitials name={row.name}/>{/if}<div><strong>{row.name}</strong>{#if admin}<small>{row.description}</small>{/if}{#if row.note}<small>{row.note}</small>{/if}</div></div></td><td>{admin?row.shop:money(row.lowest_price)}</td><td>{admin?[row.brand,row.category].filter(Boolean).join(' / ')||'—':row.sold+' / '+row.stock+(Number(row.stock)===0?' · Out of stock':'')}</td><td><span class="badge">{label(row.status)}</span></td><td>{admin?date(row.created_at):row.actor}</td><td class="row-actions">
+  {#each list as row (row.id)}<tr><td><div class="table-item">{#if row.image}<ResponsiveImage src={row.image} alt="" sizes="40px" uploadSize="thumbnail" />{:else}<ProductInitials name={row.name}/>{/if}<div><strong>{row.name}</strong>{#if admin}<small>{row.description}</small>{/if}{#if row.note}<small>{row.note}</small>{/if}</div></div></td><td>{admin?row.shop:money(row.lowest_price)}</td><td>{admin?[row.brand,row.category].filter(Boolean).join(' / ')||'—':row.sold+' / '+row.stock+(Number(row.stock)===0?' · Out of stock':'')}</td><td><span class="badge">{label(row.status)}</span></td><td>{admin?date(row.created_at):row.actor}</td><td class="row-actions">
     {#if admin}
       {#if row.status==='pending'}<button disabled={pending} onclick={()=>moderate(row,'active')}>Approve</button><button disabled={pending} onclick={()=>moderate(row,'rejected')}>Reject</button>{/if}
       {#if row.status==='active'}<button disabled={pending} onclick={()=>moderate(row,'inactive')}>Make inactive</button>{/if}
@@ -196,7 +197,7 @@
       </section>
     {:else if section==='products'&&record&&!admin&&data.id}
       <section class="panel"><div class="split"><span class="badge">{label(data.status)}</span><button onclick={()=>form('Edit and resubmit product',productFields(data),input=>api(base+'/products/'+record,'PUT',input))}>Edit product</button></div>
-        {#if data.image}<img class="record-image" src={data.image} alt={data.name}>{:else}<div class="record-image record-placeholder"><ProductInitials name={data.name}/></div>{/if}<p>{data.description}</p>{#if data.note}<p class="feedback">{data.note}</p>{/if}
+        {#if data.image}<ResponsiveImage class="record-image" src={data.image} alt={data.name} sizes="230px" />{:else}<div class="record-image record-placeholder"><ProductInitials name={data.name}/></div>{/if}<p>{data.description}</p>{#if data.note}<p class="feedback">{data.note}</p>{/if}
         <p class="muted">{data.brand??'—'} / {data.category??'—'} · Last updated by {data.actor}</p><p>Orders <strong>{data.counts.reduce((total:number,count:Row)=>total+Number(count.value),0)}</strong> · Sold <strong>{data.sold}</strong> · Stock <strong>{data.stock}</strong></p><div class="tags">{#each data.counts as count (count.status)}<span>{label(count.status)} · {count.value}</span>{/each}</div>
       </section>
       <section class="panel section"><div class="split"><h2>Variants</h2><button onclick={newVariant}><Plus size={16}/> Add variant</button></div>
@@ -233,7 +234,7 @@
       <section class="panel">
         {#if admin}{@render filter(true,section==='reviews')}{/if}
         <div class="table-scroll"><table><thead><tr><th>Name</th><th>Details</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-          {#each rows as row (row.id)}<tr><td><strong>{row.name}</strong>{#if section==='couriers'&&row.logo}<img class="table-logo" src={row.logo} alt="">{/if}</td>
+          {#each rows as row (row.id)}<tr><td><strong>{row.name}</strong>{#if section==='couriers'&&row.logo}<ResponsiveImage class="table-logo" src={row.logo} alt="" sizes="36px" uploadSize="thumbnail" />{/if}</td>
           <td>{#if section==='payments'}<span class="id-cell">{row.checkout_no}</span><br>{money(row.total)} · {date(row.created_at)}{:else if section==='reviews'}{row.user} · {row.shop} · {date(row.created_at)}<br>{row.body}{:else}{row.email??row.owner??row.url??'—'}{/if}</td>
           <td>{section==='reviews'?row.rating+'/5':section==='payments'?label(row.payment):(section==='team' ? row.role+' ? '+(row.suspended?'Suspended':row.active?'Active':'Inactive') : row.role)??(row.suspended?'Suspended':row.admin?'Administrator':section==='couriers'?'Available':'Active')}</td>
           <td class="row-actions">

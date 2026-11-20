@@ -2,6 +2,7 @@
   import { ArrowUpRight, Store } from '@lucide/svelte';
   import { money, searchHitPath, type Row } from './api';
   import ProductInitials from './ProductInitials.svelte';
+  import ResponsiveImage from './ResponsiveImage.svelte';
   import SearchKindBadge from './SearchKindBadge.svelte';
   let { items, showKinds = false }: { items: Row[]; showKinds?: boolean } = $props();
 </script>
@@ -11,7 +12,9 @@
     <a class="product-card" href={searchHitPath({kind, id: product.id})}>
       <div class="product-image" class:shop-result={kind === 'shop'}>
         {#if kind === 'shop'}<Store size={42} aria-hidden="true"/>
-        {:else if product.image}<img src={product.image} alt={product.name} loading="lazy" />
+        {:else if product.image}
+          <ResponsiveImage src={product.image} alt={product.name}
+            sizes="(max-width: 620px) calc(50vw - 17px), (max-width: 900px) calc(25vw - 16px), (max-width: 1320px) calc(25vw - 28px), 302px" />
         {:else}<ProductInitials name={product.name}/>{/if}
         {#if showKinds}<SearchKindBadge {kind}/>{/if}
         <span class="product-arrow"><ArrowUpRight size={17}/></span>

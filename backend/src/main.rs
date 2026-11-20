@@ -4,6 +4,7 @@ mod commerce;
 mod operations;
 mod search;
 mod test_seed;
+mod uploads;
 
 use axum::{
     Json, Router,
@@ -224,8 +225,8 @@ async fn main() -> anyhow::Result<()> {
         catalog::seed(&app).await?;
     }
     search::prepare(&app).await?;
-    tokio::fs::create_dir_all("uploads").await?;
-    tokio::fs::create_dir_all("private-uploads").await?;
+    tokio::fs::create_dir_all(uploads::PUBLIC_DIR).await?;
+    tokio::fs::create_dir_all(uploads::PRIVATE_DIR).await?;
     tokio::spawn(search::index_worker(app.clone()));
     let compress_json = SizeAbove::default().and(|_, _, headers: &HeaderMap, _: &Extensions| {
         headers.get(CONTENT_TYPE).is_some_and(|content_type| {
@@ -245,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
                 .layer(CompressionLayer::new().compress_when(compress_json))
                 .layer(middleware::from_fn(require_acceptable_encoding)),
         )
-        .nest_service("/uploads", ServeDir::new("uploads"))
+        .nest_service("/uploads", uploads::public_files(uploads::PUBLIC_DIR))
         .fallback_service(
             ServeDir::new("../frontend/dist")
                 .fallback(ServeFile::new("../frontend/dist/index.html")),

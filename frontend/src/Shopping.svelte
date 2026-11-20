@@ -6,6 +6,7 @@
   import CursorMore from './CursorMore.svelte';
   import ProductGrid from './ProductGrid.svelte';
   import ProductInitials from './ProductInitials.svelte';
+  import ResponsiveImage from './ResponsiveImage.svelte';
   import Fields from './Fields.svelte';
   let {page,parts,changed}: {page:string;parts:string[];changed:()=>Promise<void>}=$props();
   let id=$derived(Number(parts[1]));
@@ -134,7 +135,7 @@
 {#snippet media(files:string[])}
   {#if files?.length}<div class="media-row">{#each files as file (file)}
     {#if /\.(mp4|webm)$/.test(file)}<video src={file} controls aria-label="Customer attachment"><track kind="captions" /></video>
-    {:else}<a href={file} target="_blank" rel="noreferrer"><img src={file} alt="Customer attachment"></a>{/if}
+    {:else}<a href={file} target="_blank" rel="noreferrer"><ResponsiveImage src={file} alt="Customer attachment" sizes="106px" uploadSize="thumbnail" /></a>{/if}
   {/each}</div>{/if}
 {/snippet}
 {#snippet lines(items:Row[])}
@@ -149,7 +150,9 @@
 {:else if page==='product' && data}
   <a class="breadcrumb" href="/"><ArrowLeft size={16}/> Marketplace</a>
   <section class="detail-grid">
-    <div class="detail-image">{#if data.image}<img src={data.image} alt={data.name}>{:else}<ProductInitials name={data.name}/>{/if}</div>
+    <div class="detail-image">{#if data.image}<ResponsiveImage src={data.image} alt={data.name}
+      sizes="(max-width: 620px) calc(100vw - 24px), (max-width: 900px) calc(50vw - 25px), (max-width: 1320px) calc(50vw - 38px), 622px"
+      uploadSize="detail" loading="eager" />{:else}<ProductInitials name={data.name}/>{/if}</div>
     <div class="panel product-detail">
       <a class="shop-name" href={'/shop/'+data.shop_id}><Store size={18}/> {data.shop}</a>
       <h1>{data.name}</h1><strong class="detail-price">{money(variant?.price)}</strong>
@@ -171,7 +174,7 @@
     <div class="detail-grid cart-layout"><div class="panel cart-list">
       {#each rows as row (row.id)}<article class:unavailable={row.reason} class="cart-row">
         <input type="checkbox" aria-label={'Select '+row.product_name} value={row.id} bind:group={selected} disabled={Boolean(row.reason)}>
-        <a class="thumb" href={'/product/'+row.product_id} aria-label={row.product_name}>{#if row.image}<img src={row.image} alt="">{:else}<ProductInitials name={row.product_name}/>{/if}</a>
+        <a class="thumb" href={'/product/'+row.product_id} aria-label={row.product_name}>{#if row.image}<ResponsiveImage src={row.image} alt="" sizes="58px" uploadSize="thumbnail" />{:else}<ProductInitials name={row.product_name}/>{/if}</a>
         <div class="cart-product"><a href={'/product/'+row.product_id}><strong>{row.product_name}</strong></a><small>{row.variant}{row.subvariant?' / '+row.subvariant:''} · {row.shop}</small><small>Added {ago(row.created_at).toLowerCase()}</small>{#if row.reason}<span class="badge">{row.reason}</span>{/if}</div>
         <label class="quantity"><span class="sr-only">Quantity for {row.product_name}</span><input type="number" min="1" max="999" value={row.quantity} disabled={pending||Boolean(row.reason)} onchange={(e)=>updateCart(row,Number(e.currentTarget.value))}></label>
         <strong>{money(row.price)}</strong><button class="text-button" disabled={pending} onclick={()=>updateCart(row,0)}>Remove</button>
@@ -185,7 +188,7 @@
       <div class="stack">
         <section class="panel"><h2><MapPin size={20}/> Shipping address</h2>{#if addresses.length}<label class="field">Saved addresses<select bind:value={addressId} onchange={getQuote}>{#each addresses as address (address.id)}<option value={address.id}>{address.label} · {address.detail}</option>{/each}</select></label>{/if}
         <details open={!addresses.length}><summary>Add an address</summary><Fields fields={[{name:'label',label:'Address label'},{name:'detail',label:'Recipient, phone and full address',type:'textarea'}]} button="Save address" submit={addAddress}/></details></section>
-        <section class="panel"><h2><CreditCard size={20}/> Payment method</h2><label class="check"><input type="radio" name="payment" checked> Manual payment</label><div class="gateway"><span>Online payments coming later</span><div>{#each ['QRIS','BCA','BRI','Mandiri'] as brand (brand)}<button disabled><img src={'/payment/'+brand.toLowerCase()+'.svg'} alt={brand}></button>{/each}</div></div></section>
+        <section class="panel"><h2><CreditCard size={20}/> Payment method</h2><label class="check"><input type="radio" name="payment" checked> Manual payment</label><div class="gateway"><span>Online payments coming later</span><div>{#each ['QRIS','BCA','BRI','Mandiri'] as brand (brand)}<button disabled><ResponsiveImage src={'/payment/'+brand.toLowerCase()+'.svg'} alt={brand} sizes="51px" /></button>{/each}</div></div></section>
         {#if summary}{#each Object.entries(summary.groups) as [shop,g] (shop)}
           <section class="panel"><h3><Store size={17}/> {(g as Row).shop}</h3>{@render lines((g as Row).items)}<p>Shipping · {(g as Row).grams/1000} kg · {money((g as Row).shipping)}</p></section>
         {/each}{/if}

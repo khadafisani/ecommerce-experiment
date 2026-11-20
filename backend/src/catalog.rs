@@ -1,5 +1,5 @@
 use super::*;
-use crate::auth::User;
+use crate::{auth::User, uploads};
 use axum::{
     extract::{Multipart, Path, Query, State},
     routing::{get, post},
@@ -123,23 +123,10 @@ async fn upload(user: User, Query(options): Query<UploadOptions>, mut form: Mult
     if bytes.len() > 20 * 1024 * 1024 {
         return Err(Error::bad("The maximum file size is 20 MB"));
     }
-    let (extension, output) = match mime.as_str() {
-        "video/mp4" if bytes.get(4..8) == Some(b"ftyp") => ("mp4", bytes.to_vec()),
-        "video/webm" if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => ("webm", bytes.to_vec()),
-        _ if mime.starts_with("image/") && bytes.len() <= 8 * 1024 * 1024 => {
-            let image = tokio::task::spawn_blocking(move || {
-                img4avif::Converter::new(
-                    img4avif::Config::default()
-                        .max_pixels(20_000_000)
-                        .max_input_bytes(8 * 1024 * 1024),
-                )?
-                .convert(&bytes)
-            })
-            .await
-            .map_err(Error::internal)?
-            .map_err(|_| Error::bad("This image could not be converted to AVIF"))?;
-            ("avif", image)
-        }
+    let extension = match mime.as_str() {
+        "video/mp4" if bytes.get(4..8) == Some(b"ftyp") => "mp4",
+        "video/webm" if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => "webm",
+        _ if mime.starts_with("image/") && bytes.len() <= uploads::MAX_IMAGE_BYTES => "avif",
         _ => {
             return Err(Error::bad(
                 "Choose an image up to 8 MB or an MP4/WebM video up to 20 MB",
@@ -147,19 +134,24 @@ async fn upload(user: User, Query(options): Query<UploadOptions>, mut form: Mult
         }
     };
     let id = uuid::Uuid::new_v4();
-    let (directory, url, name) = if options.private {
+    let (directory, url, stem) = if options.private {
         (
-            "private-uploads",
-            "/api/return-media",
-            format!("{}-{id}.{extension}", user.id),
+            uploads::PRIVATE_DIR,
+            RETURN_MEDIA_PREFIX,
+            format!("{}-{id}", user.id),
         )
     } else {
-        ("uploads", "/uploads", format!("{id}.{extension}"))
+        (uploads::PUBLIC_DIR, "/uploads/", id.to_string())
     };
-    tokio::fs::write(format!("{directory}/{name}"), output)
-        .await
-        .map_err(Error::internal)?;
-    Ok(Json(json!({"url":format!("{url}/{name}")})))
+    let name = format!("{stem}.{extension}");
+    if extension == "avif" {
+        uploads::save_image(directory, stem, bytes).await?;
+    } else {
+        tokio::fs::write(std::path::Path::new(directory).join(&name), bytes)
+            .await
+            .map_err(Error::internal)?;
+    }
+    Ok(Json(json!({"url":format!("{url}{name}")})))
 }
 pub const RETURN_MEDIA_PREFIX: &str = "/api/return-media/";
 pub fn return_media_name(name: &str) -> Option<(i64, &'static str)> {

@@ -7,8 +7,7 @@
   import ProductGrid from './ProductGrid.svelte';
   import SearchBar from './SearchBar.svelte';
   import Fields, {type Field} from './Fields.svelte';
-  import Shopping from './Shopping.svelte';
-  import Workspace from './Workspace.svelte';
+  import ResponsiveImage from './ResponsiveImage.svelte';
   const parts = location.pathname.split('/').filter(Boolean);
   const search = new URLSearchParams(location.search);
   const page = parts[0] ?? '';
@@ -78,6 +77,10 @@
   }
 </script>
 
+{#snippet routeError()}
+  <p class="error" role="alert">This page could not load. <button onclick={() => location.reload()}>Reload page</button></p>
+{/snippet}
+
 <svelte:window onbeforeunload={checkoutLeave}/>
 <header class="site-header">
   <div class="header-inner wrap">
@@ -117,7 +120,11 @@
     {#if page===''&&!category}
       <section class="hero">
         <div class="hero-content"><div class="eyebrow"><span></span> THE EVERYDAY EDIT</div><h1>Good finds.<br><em>Better days.</em></h1><p>Discover something for every day, from independent shops and brands.</p><a class="hero-button" href="#catalog">Explore products <ArrowRight size={17}/></a></div>
-        <div class="hero-image" role="img" aria-label="Sunlit home with thoughtfully styled furniture"></div>
+        <div class="hero-image">
+          <ResponsiveImage src="/catalog/hero.jpg" alt="Sunlit home with thoughtfully styled furniture"
+            sizes="(max-width: 620px) calc(100vw - 24px), (max-width: 900px) calc(47vw - 16px), (max-width: 1320px) calc(47vw - 28px), 592px"
+            loading="eager" fetchpriority="high" />
+        </div>
       </section>
       <div class="service-strip"><span><Store size={18}/> Shop independent</span><span><Package size={18}/> Delivery from every shop</span><span><Truck size={18}/> Track your orders</span></div>
     {/if}
@@ -151,11 +158,25 @@
       {#if page!=='search'}<CursorMore cursor={pager.cursor} loading={pager.loading} error={pager.error} next={()=>pager.next()}/>{/if}
     </section>
   {:else if portal!=='customer'}
-    {#if account&&!account.user.guest}<Workspace {portal} {parts} {account}/>{:else}<section class="panel empty"><h1>{labelPortal(portal)}</h1><a class="primary" href={prefix+'/login'}>Sign in</a></section>{/if}
+    {#if account&&!account.user.guest}
+      {#await import('./Workspace.svelte')}
+        <p class="inline-empty" role="status">Loading workspace…</p>
+      {:then { default: Workspace }}
+        <Workspace {portal} {parts} {account}/>
+      {:catch}
+        {@render routeError()}
+      {/await}
+    {:else}<section class="panel empty"><h1>{labelPortal(portal)}</h1><a class="primary" href={prefix+'/login'}>Sign in</a></section>{/if}
   {:else if page==='profile'}
     <section class="panel auth"><h1>My profile</h1>{#if account}<p><strong>{account.user.name}</strong><br>{account.user.guest ? "Guest checkout on this browser" : account.user.email}</p><div class="actions"><a class="button" href="/orders">My orders</a><a class="button" href="/notifications">Notifications</a><a class="primary" href="/merchant">Merchant workspace</a></div>{:else}<a href="/login">Sign in</a>{/if}</section>
   {:else}
-    <Shopping {page} {parts} changed={updateCount}/>
+    {#await import('./Shopping.svelte')}
+      <p class="inline-empty" role="status">Loading…</p>
+    {:then { default: Shopping }}
+      <Shopping {page} {parts} changed={updateCount}/>
+    {:catch}
+      {@render routeError()}
+    {/await}
   {/if}
 </main>
 <footer class="site-footer"><div class="wrap"><a href="/" class="footer-brand">tosca<span>.</span> market</a><nav aria-label="Footer"><a href="/merchant">Merchant workspace</a><a href="/orders">My orders</a><a href="/admin/login">Admin</a></nav></div></footer>

@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     auth::User,
     catalog::{self, Filter, decode_rows},
+    uploads::{self, ImageSize},
 };
 use axum::{
     extract::{Path, Query, State},
@@ -454,10 +455,15 @@ fn validate_media(media: &[String]) -> Result<()> {
     }
     Ok(())
 }
+#[derive(Deserialize)]
+struct ReturnMediaOptions {
+    size: Option<ImageSize>,
+}
 async fn return_media(
     State(app): State<App>,
     user: User,
     Path(name): Path<String>,
+    Query(options): Query<ReturnMediaOptions>,
 ) -> Result<Response> {
     let (_, mime) = catalog::return_media_name(&name).ok_or_else(Error::missing)?;
     let path = format!("{}{name}", catalog::RETURN_MEDIA_PREFIX);
@@ -466,7 +472,7 @@ async fn return_media(
     if !allowed {
         return Err(Error::missing());
     }
-    let bytes = tokio::fs::read(format!("private-uploads/{name}"))
+    let bytes = uploads::read_private(&name, options.size)
         .await
         .map_err(|_| Error::missing())?;
     Ok((
@@ -493,7 +499,7 @@ async fn request_return(
             .strip_prefix(catalog::RETURN_MEDIA_PREFIX)
             .ok_or_else(|| Error::bad("Upload return evidence first"))?;
         if !catalog::return_media_name(name).is_some_and(|(owner, _)| owner == user.id)
-            || !tokio::fs::try_exists(format!("private-uploads/{name}"))
+            || !tokio::fs::try_exists(std::path::Path::new(uploads::PRIVATE_DIR).join(name))
                 .await
                 .map_err(Error::internal)?
         {
