@@ -1,0 +1,22 @@
+{
+  "name": "tosca-market",
+  "private": true,
+  "packageManager": "bun@1.4.4",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json --tsgo"
+  },
+  "dependencies": {
+    "svelte": "5.58.0",
+    "@lucide/svelte": "latest"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "@typescript/native": "npm:typescript@7",
+    "svelte-check": "latest",
+    "typescript": "~6",
+    "vite": "^8.3.8"
+  }
+}

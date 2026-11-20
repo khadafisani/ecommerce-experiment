@@ -1,0 +1,34 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDirs": [
+      "..",
+      "svelte"
+    ],
+    "allowArbitraryExtensions": true,
+    "noEmit": true,
+    "incremental": false,
+    "tsBuildInfoFile": "tsbuildinfo.json"
+  },
+  "files": [
+    "../node_modules/svelte-check/dist/src/svelte-shims-v4.d.ts",
+    "../node_modules/svelte/svelte-html.d.ts"
+  ],
+  "include": [
+    "../src/**/*",
+    "svelte/src/**/*"
+  ],
+  "exclude": [
+    "../src/App.svelte",
+    "../src/AreaChart.svelte",
+    "../src/Chart.svelte",
+    "../src/CursorMore.svelte",
+    "../src/Fields.svelte",
+    "../src/ProductGrid.svelte",
+    "../src/ProductInitials.svelte",
+    "../src/SearchBar.svelte",
+    "../src/SearchKindBadge.svelte",
+    "../src/Shopping.svelte",
+    "../src/Workspace.svelte"
+  ]
+}
