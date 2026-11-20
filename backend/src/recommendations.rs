@@ -230,7 +230,16 @@ async fn candidate_ids(
             &filters,
             &profile,
         ))?);
-        cache.rank(key, filters, profile, now).await
+        let anchors = cache::read_products(
+            &app.db,
+            profile
+                .iter()
+                .map(|signal| signal.product_id)
+                .chain(filters.product_id)
+                .collect(),
+        )
+        .await?;
+        cache.rank(key, filters, profile, now, anchors).await
     };
     ranked
         .await
@@ -432,13 +441,29 @@ async fn live_cards(
     excluded: &[i64],
     limit: usize,
 ) -> Result<Vec<Value>> {
-    let mut query = QueryBuilder::<MySql>::new(
-        "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'shop_id',s.id,'shop',s.name,
-         'category',c.name,'lowest_price',MIN(v.price)) FROM products p
-         JOIN shops s ON s.id=p.shop_id LEFT JOIN taxonomy c ON c.id=p.category_id
-         JOIN variants v ON v.product_id=p.id AND v.enabled AND v.stock>0
-         WHERE p.status='active' AND NOT s.suspended",
-    );
+    const STOCK_PRICE: &str =
+        "(SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled AND v.stock>0)";
+    let by_price = matches!(filters.sort, Sort::PriceAsc | Sort::PriceDesc);
+    let mut query = if by_price {
+        QueryBuilder::<MySql>::new(
+            "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'shop_id',s.id,'shop',s.name,
+             'category',c.name,'lowest_price',MIN(v.price)) FROM products p
+             JOIN shops s ON s.id=p.shop_id LEFT JOIN taxonomy c ON c.id=p.category_id
+             JOIN variants v ON v.product_id=p.id AND v.enabled AND v.stock>0
+             WHERE p.status='active' AND NOT s.suspended",
+        )
+    } else {
+        let index = match (ids, filters.shop_id, filters.category_id) {
+            (Some(_), _, _) => "PRIMARY",
+            (_, _, Some(_)) => "product_category_status_id",
+            (_, Some(_), _) => "product_shop_status_id",
+            _ => "status",
+        };
+        crate::catalog::ordered_cards(index, format!(
+            "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'shop_id',s.id,'shop',s.name,
+             'category',c.name,'lowest_price',{STOCK_PRICE})"
+        ))
+    };
     for (value, clause) in [
         (filters.product_id, " AND p.id<>"),
         (filters.category_id, " AND p.category_id="),
@@ -461,12 +486,22 @@ async fn live_cards(
             params.push_unseparated(")");
         }
     }
-    query.push(" GROUP BY p.id,p.name,p.image,s.id,s.name,c.name HAVING COUNT(*)>0");
-    if let Some(price) = filters.min_price {
-        query.push(" AND MIN(v.price)>=").push_bind(price);
-    }
-    if let Some(price) = filters.max_price {
-        query.push(" AND MIN(v.price)<=").push_bind(price);
+    if by_price {
+        query.push(" GROUP BY p.id,p.name,p.image,s.id,s.name,c.name HAVING COUNT(*)>0");
+        if let Some(price) = filters.min_price {
+            query.push(" AND MIN(v.price)>=").push_bind(price);
+        }
+        if let Some(price) = filters.max_price {
+            query.push(" AND MIN(v.price)<=").push_bind(price);
+        }
+    } else {
+        query
+            .push(" AND ")
+            .push(STOCK_PRICE)
+            .push(" BETWEEN ")
+            .push_bind(filters.min_price.unwrap_or(i64::MIN))
+            .push(" AND ")
+            .push_bind(filters.max_price.unwrap_or(i64::MAX));
     }
     query.push(match filters.sort {
         Sort::PriceAsc => " ORDER BY MIN(v.price) ASC,p.id DESC",
@@ -483,22 +518,33 @@ pub async fn refresh_worker(app: App) {
     };
     loop {
         let started = std::time::Instant::now();
-        let result = async {
-            let rows = cache::read_catalog(&app.db).await?;
-            cache.refresh(rows, started).await
+        let result = match tokio::time::timeout(
+            Duration::from_secs(15),
+            cache::read_catalog(&app.db),
+        )
+        .await
+        {
+            Ok(Ok(rows)) => {
+                let candidates = rows.len();
+                let result = cache.refresh(rows, started).await;
+                if result.is_ok() {
+                    tracing::debug!(candidates, elapsed = ?started.elapsed(), "recommendation candidates refreshed");
+                }
+                result
+            }
+            Ok(Err(error)) => Err(error),
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("reading recommendation candidates"))
+            }
         };
-        match tokio::time::timeout(Duration::from_secs(15), result).await {
-            Ok(Ok(())) => {
+        match result {
+            Ok(()) => {
                 let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 4;
                 tokio::time::sleep_until((started + TTL - Duration::from_secs(jitter + 1)).into())
                     .await;
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 tracing::warn!(%error, "recommendation refresh failed");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Err(_) => {
-                tracing::warn!("recommendation refresh timed out");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }

@@ -1,3 +1,4 @@
+mod amazon_import;
 mod auth;
 mod catalog;
 mod commerce;
@@ -177,23 +178,27 @@ async fn require_acceptable_encoding(request: Request, next: Next) -> Response {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
-    let seed_test = match env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [flag] if flag == "--seed-test" => true,
-        _ => anyhow::bail!("Usage: tosca-market [--seed-test]"),
+    let args: Vec<_> = env::args().skip(1).collect();
+    let (seed_test, amazon_import) = match args.as_slice() {
+        [] => (false, None),
+        [flag] if flag == "--seed-test" => (true, None),
+        [flag, rest @ ..] if flag == "--import-amazon" => {
+            (false, Some(amazon_import::Options::parse(rest)?))
+        }
+        _ => anyhow::bail!("Usage: tosca-market [--seed-test | --import-amazon [--limit TOTAL]]"),
     };
     let url = setting(
         "DATABASE_URL",
         "mysql://root:root@127.0.0.1:3306/tosca_market",
     );
-    if seed_test {
+    if seed_test || amazon_import.is_some() {
         let options: sqlx::mysql::MySqlConnectOptions = url.parse()?;
         anyhow::ensure!(
             matches!(
                 options.get_host(),
                 "127.0.0.1" | "localhost" | "::1" | "[::1]"
             ),
-            "Test seed data can only be added to a local database"
+            "Test catalog data can only be added to a local database"
         );
     }
     if !MySql::database_exists(&url).await? {
@@ -208,6 +213,10 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     tracing::info!(%version, "MariaDB connected");
     sqlx::migrate!().run(&db).await?;
+    if let Some(options) = amazon_import {
+        let search = search::Search::new(false, embeddings::Embedder::new(false))?;
+        return amazon_import::run(&db, &search, options).await;
+    }
     let secret = setting("JWT_SECRET", "");
     if secret.len() < 32 {
         anyhow::bail!("Set JWT_SECRET to at least 32 bytes in .env");

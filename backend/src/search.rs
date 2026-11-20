@@ -22,6 +22,11 @@ mod shops;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const INDEX_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const TASK_TIMEOUT: Duration = Duration::from_secs(15);
+const BULK_TASK_TIMEOUT: Duration = Duration::from_secs(600);
+const LIVE_BATCH_SIZE: u32 = 256;
+const BULK_BATCH_SIZE: u32 = 50_000;
+const SQL_BATCH_SIZE: usize = 10_000;
 
 #[derive(Clone)]
 pub struct Search {
@@ -182,12 +187,16 @@ async fn try_lock(conn: &mut MySqlConnection) -> anyhow::Result<bool> {
 }
 
 async fn wait_for_task(client: &Client, info: TaskInfo) -> anyhow::Result<()> {
+    wait_for_task_with_timeout(client, info, TASK_TIMEOUT).await
+}
+
+async fn wait_for_task_with_timeout(
+    client: &Client,
+    info: TaskInfo,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let task = info
-        .wait_for_completion(
-            client,
-            Some(Duration::from_millis(100)),
-            Some(Duration::from_secs(15)),
-        )
+        .wait_for_completion(client, Some(Duration::from_millis(100)), Some(timeout))
         .await?;
     match task {
         Task::Succeeded { .. } => Ok(()),
@@ -259,17 +268,20 @@ async fn publish_batch(
     conn: &mut MySqlConnection,
     index: &Index,
     definition: &IndexDefinition,
-) -> anyhow::Result<()> {
+    batch_size: u32,
+    task_timeout: Duration,
+) -> anyhow::Result<usize> {
     let query = sqlx::query_as(definition.select_jobs);
     let query = if definition.entity_type == "product" {
         query.bind(embeddings::MODEL)
     } else {
         query
     };
-    let jobs: Vec<Job> = query.fetch_all(&mut *conn).await?;
+    let jobs: Vec<Job> = query.bind(batch_size).fetch_all(&mut *conn).await?;
     if jobs.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let count = jobs.len();
 
     let mut upserts = Vec::new();
     let mut removed = Vec::new();
@@ -288,37 +300,46 @@ async fn publish_batch(
             None => removed.push(job.entity_id),
         }
     }
-    if !products.is_empty() {
-        embeddings::enqueue(&mut *conn, &products).await?;
+    for ids in products.chunks(SQL_BATCH_SIZE) {
+        embeddings::enqueue(&mut *conn, ids).await?;
     }
     if !removed.is_empty() {
-        wait_for_task(&search.client, index.delete_documents(&removed).await?).await?;
+        wait_for_task_with_timeout(
+            &search.client,
+            index.delete_documents(&removed).await?,
+            task_timeout,
+        )
+        .await?;
     }
     if !upserts.is_empty() {
-        wait_for_task(
+        wait_for_task_with_timeout(
             &search.client,
             index.add_or_replace(&upserts, Some("id")).await?,
+            task_timeout,
         )
         .await?;
     }
 
     // A newer revision can arrive while Meilisearch is indexing. Only acknowledge the published revisions.
-    let mut delete = QueryBuilder::<MySql>::new("DELETE FROM search_sync_jobs WHERE entity_type=");
-    delete
-        .push_bind(definition.entity_type)
-        .push(" AND (entity_id,revision) IN (");
-    let mut pairs = delete.separated(",");
-    for job in jobs {
-        pairs
-            .push("(")
-            .push_bind_unseparated(job.entity_id)
-            .push_unseparated(",")
-            .push_bind_unseparated(job.revision)
-            .push_unseparated(")");
+    for batch in jobs.chunks(SQL_BATCH_SIZE) {
+        let mut delete =
+            QueryBuilder::<MySql>::new("DELETE FROM search_sync_jobs WHERE entity_type=");
+        delete
+            .push_bind(definition.entity_type)
+            .push(" AND (entity_id,revision) IN (");
+        let mut pairs = delete.separated(",");
+        for job in batch {
+            pairs
+                .push("(")
+                .push_bind_unseparated(job.entity_id)
+                .push_unseparated(",")
+                .push_bind_unseparated(job.revision)
+                .push_unseparated(")");
+        }
+        pairs.push_unseparated(")");
+        delete.build().persistent(false).execute(&mut *conn).await?;
     }
-    pairs.push_unseparated(")");
-    delete.build().execute(conn).await?;
-    Ok(())
+    Ok(count)
 }
 
 async fn pending(conn: &mut MySqlConnection) -> anyhow::Result<bool> {
@@ -333,7 +354,14 @@ async fn publish_pending(search: &Search, conn: &mut MySqlConnection) -> anyhow:
     for (index, definition) in search.indexes() {
         tokio::time::timeout(
             Duration::from_secs(40),
-            publish_batch(search, conn, index, definition),
+            publish_batch(
+                search,
+                conn,
+                index,
+                definition,
+                LIVE_BATCH_SIZE,
+                TASK_TIMEOUT,
+            ),
         )
         .await??;
     }
@@ -434,5 +462,47 @@ pub async fn rebuild(app: &App) -> anyhow::Result<()> {
     if let Some(mut conn) = locked_connection(app).await? {
         prepare_locked(&app.search, &mut conn).await?;
     }
+    Ok(())
+}
+
+pub(super) async fn sync_bulk(db: &sqlx::MySqlPool, search: &Search) -> anyhow::Result<()> {
+    let mut conn = MySqlConnection::connect_with(&db.connect_options()).await?;
+    loop {
+        if try_lock(&mut conn).await? {
+            break;
+        }
+        // The API owns the same queue while it is running.
+        if !pending(&mut conn).await?
+            && settings_match(&search.shops, &(shops::INDEX.settings)()).await?
+            && settings_match(&search.products, &(products::INDEX.settings)()).await?
+        {
+            conn.close().await?;
+            return Ok(());
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    ensure_indexes(search, &mut conn, true).await?;
+    let mut processed = 0;
+    while pending(&mut conn).await? {
+        for (index, definition) in search.indexes() {
+            let count = publish_batch(
+                search,
+                &mut conn,
+                index,
+                definition,
+                BULK_BATCH_SIZE,
+                BULK_TASK_TIMEOUT,
+            )
+            .await
+            .with_context(|| format!("Syncing index {}", index.uid))?;
+            if count > 0 && definition.entity_type == "product" {
+                processed += count;
+                if processed.is_multiple_of(50_000) {
+                    tracing::info!(processed, index = %index.uid, "Amazon import search updates applied");
+                }
+            }
+        }
+    }
+    conn.close().await?;
     Ok(())
 }

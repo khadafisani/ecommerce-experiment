@@ -6,7 +6,9 @@ use axum::{
 };
 use serde::Deserialize;
 
-const ITEMS: &str = "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'shop_id',s.id,'shop',s.name,'category',c.name,'lowest_price',(SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled)) FROM products p JOIN shops s ON s.id=p.shop_id LEFT JOIN taxonomy c ON c.id=p.category_id WHERE p.status='active' AND NOT s.suspended";
+const CARD_SELECT: &str = "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'shop_id',s.id,'shop',s.name,'category',c.name,'lowest_price',(SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled))";
+const VISIBLE_CATALOG: &str =
+    " LEFT JOIN taxonomy c ON c.id=p.category_id WHERE p.status='active' AND NOT s.suspended";
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/health", get(health))
@@ -54,14 +56,21 @@ pub fn page(mut items: Vec<Value>) -> Json<Value> {
 async fn products(State(app): State<App>, Query(f): Query<Filter>) -> Result {
     let oldest = f.sort.as_deref() == Some("oldest");
     let cursor = f.cursor.unwrap_or(if oldest { 0 } else { i64::MAX });
-    let mut query = sqlx::QueryBuilder::new(ITEMS);
-    if let Some(category) = f.category.as_deref().filter(|name| !name.is_empty()) {
+    let category = f.category.as_deref().filter(|name| !name.is_empty());
+    let shop = f.shop.filter(|id| *id != 0);
+    let index = match (shop, category) {
+        (_, Some(_)) => "product_category_status_id",
+        (Some(_), _) => "product_shop_status_id",
+        _ => "status",
+    };
+    let mut query = ordered_cards(index, CARD_SELECT);
+    if let Some(category) = category {
         query
             .push(" AND p.category_id=(SELECT id FROM taxonomy WHERE kind='category' AND name=")
             .push_bind(category)
             .push(")");
     }
-    if let Some(shop) = f.shop.filter(|id| *id != 0) {
+    if let Some(shop) = shop {
         query.push(" AND p.shop_id=").push_bind(shop);
     }
     let (cursor_sql, sort_sql) = if oldest {
@@ -74,13 +83,28 @@ async fn products(State(app): State<App>, Query(f): Query<Filter>) -> Result {
     Ok(page(decode_rows(values)?))
 }
 
+pub(super) fn ordered_cards(
+    index: &'static str,
+    select: impl Into<String>,
+) -> sqlx::QueryBuilder<MySql> {
+    let mut query = sqlx::QueryBuilder::new(select);
+    query
+        .push(" FROM products p FORCE INDEX (")
+        .push(index)
+        .push(") STRAIGHT_JOIN shops s FORCE INDEX (PRIMARY) ON s.id=p.shop_id")
+        .push(VISIBLE_CATALOG);
+    query
+}
+
 pub async fn explore_tail(
     db: &MySqlPool,
     before: Option<i64>,
     excluded: &[i64],
     limit: u32,
 ) -> Result<Vec<Value>> {
-    let mut query = sqlx::QueryBuilder::new(ITEMS);
+    // Starting with an ordered product index lets MariaDB stop after filling the page.
+    // A shop-first or buffered join materializes and sorts the catalog before LIMIT.
+    let mut query = ordered_cards("status", CARD_SELECT);
     if let Some(before) = before {
         query.push(" AND p.id<").push_bind(before);
     }
@@ -104,20 +128,63 @@ pub async fn reviews(app: &App, id: i64) -> Result<Vec<Value>> {
     decode_rows(sqlx::query_scalar("SELECT JSON_OBJECT('id',r.id,'user',u.name,'rating',r.rating,'body',r.body,'media',JSON_EXTRACT(r.media,'$'),'reply',r.reply,'created_at',r.created_at) FROM reviews r JOIN users u ON u.id=r.user_id WHERE r.product_id=? AND NOT r.deleted ORDER BY r.id DESC LIMIT 100").bind(id).fetch_all(&app.db).await?)
 }
 async fn product(State(app): State<App>, Path(id): Path<i64>) -> Result {
-    let raw: String = sqlx::query_scalar("SELECT JSON_OBJECT('id',p.id,'name',p.name,'description',p.description,'image',p.image,'shop',s.name,'shop_id',s.id,'brand',b.name,'category',c.name) FROM products p JOIN shops s ON s.id=p.shop_id LEFT JOIN taxonomy b ON b.id=p.brand_id LEFT JOIN taxonomy c ON c.id=p.category_id WHERE p.id=? AND p.status='active' AND NOT s.suspended").bind(id).fetch_one(&app.db).await?;
+    let (raw, shop_id, category_id): (String, i64, Option<i64>) = sqlx::query_as(
+        "SELECT JSON_OBJECT('id',p.id,'name',p.name,'description',p.description,'image',p.image,
+            'shop',s.name,'shop_id',s.id,'brand',b.name,'category',c.name),s.id,c.id
+         FROM products p JOIN shops s ON s.id=p.shop_id
+         LEFT JOIN taxonomy b ON b.id=p.brand_id LEFT JOIN taxonomy c ON c.id=p.category_id
+         WHERE p.id=? AND p.status='active' AND NOT s.suspended",
+    )
+    .bind(id)
+    .fetch_one(&app.db)
+    .await?;
     let mut item: Value = serde_json::from_str(&raw).map_err(Error::internal)?;
-    item["variants"] = json!(variants(&app, id, false).await?);
-    item["reviews"] = json!(reviews(&app, id).await?);
-    let query = format!("{ITEMS} AND p.id<>? AND (s.id=? OR c.name=?) ORDER BY p.id DESC LIMIT 8");
-    item["similar"] = json!(decode_rows(
-        sqlx::query_scalar(sqlx::AssertSqlSafe(query))
-            .bind(id)
-            .bind(item["shop_id"].as_i64())
-            .bind(item["category"].as_str())
-            .fetch_all(&app.db)
-            .await?
-    )?);
+    let (variants, reviews, similar) = tokio::try_join!(
+        variants(&app, id, false),
+        reviews(&app, id),
+        similar_products(&app.db, id, shop_id, category_id),
+    )?;
+    item["variants"] = json!(variants);
+    item["reviews"] = json!(reviews);
+    item["similar"] = json!(similar);
     Ok(Json(item))
+}
+
+async fn similar_products(
+    db: &MySqlPool,
+    id: i64,
+    shop_id: i64,
+    category_id: Option<i64>,
+) -> Result<Vec<Value>> {
+    // The newest eight rows from either index are sufficient to find the newest
+    // eight in their union. Fetch card details only after choosing those IDs.
+    let query = format!(
+        "{CARD_SELECT}
+         FROM (
+            SELECT id FROM (
+                (SELECT p.id FROM products p FORCE INDEX (shop_id)
+                 WHERE p.shop_id=? AND p.status='active' AND p.id<>?
+                   AND (SELECT s.suspended FROM shops s WHERE s.id=p.shop_id)=0
+                 ORDER BY p.id DESC LIMIT 8)
+                UNION DISTINCT
+                (SELECT p.id FROM products p FORCE INDEX (product_category_status_id)
+                 WHERE p.category_id=? AND p.status='active' AND p.id<>?
+                   AND (SELECT s.suspended FROM shops s WHERE s.id=p.shop_id)=0
+                 ORDER BY p.id DESC LIMIT 8)
+            ) candidates ORDER BY id DESC LIMIT 8
+         ) related STRAIGHT_JOIN products p FORCE INDEX (PRIMARY) ON p.id=related.id
+         JOIN shops s ON s.id=p.shop_id
+         {VISIBLE_CATALOG} ORDER BY p.id DESC"
+    );
+    decode_rows(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .bind(shop_id)
+            .bind(id)
+            .bind(category_id)
+            .bind(id)
+            .fetch_all(db)
+            .await?,
+    )
 }
 async fn categories(State(app): State<App>) -> Result {
     Ok(Json(json!(rows(&app.db, "SELECT JSON_OBJECT('id',id,'name',name,'kind',kind) FROM taxonomy WHERE status='approved' ORDER BY name").await?)))

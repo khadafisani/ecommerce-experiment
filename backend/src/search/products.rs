@@ -3,7 +3,7 @@ use crate::embeddings::{DIMENSIONS, MODEL};
 use meilisearch_sdk::settings::{Embedder, EmbedderSource, Settings};
 
 pub(super) const INDEX: IndexDefinition = IndexDefinition {
-    uid_prefix: "tosca_market_products_v5",
+    uid_prefix: "tosca_market_products_v5_amazon",
     entity_type: "product",
     settings,
     displayed: &["id", "name", "lowest_price"],
@@ -24,7 +24,7 @@ pub(super) const INDEX: IndexDefinition = IndexDefinition {
         LEFT JOIN recommendation_product_text t ON t.id=p.id
         LEFT JOIN product_embeddings e ON e.product_id=p.id AND e.model=?
             AND e.fingerprint=SHA2(t.passage,256)
-        WHERE j.entity_type='product' ORDER BY j.updated_at,j.entity_id LIMIT 256",
+        WHERE j.entity_type='product' ORDER BY j.updated_at,j.entity_id LIMIT ?",
 };
 
 fn settings() -> Settings {

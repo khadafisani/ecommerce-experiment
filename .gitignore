@@ -11,3 +11,6 @@ scripts
 skills-lock.json
 *.lock
 .codex
+amazon_categories.csv
+amazon_products.csv
+**/import-amazon.ps1

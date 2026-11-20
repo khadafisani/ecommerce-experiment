@@ -54,6 +54,7 @@ async fn compare_replica(
             filters.clone(),
             Vec::new(),
             chrono::Utc::now().timestamp(),
+            Vec::new(),
         )
         .await?
         .context("benchmark cache unavailable")?;

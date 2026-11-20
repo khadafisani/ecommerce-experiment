@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { ArrowRight, Bell, ChevronDown, ChevronRight, Coffee, Headphones, House, LayoutGrid, Package, Shirt, ShoppingBag, Sparkles, Store, Truck, UserRound, Volleyball } from '@lucide/svelte';
+  import { ArrowRight, Bell, ChevronDown, ChevronRight, Package, ShoppingBag, Store, Truck, UserRound } from '@lucide/svelte';
   import { api, clear, exploreRecommendations, groupSearchHits, guestCart, guestSession, key, logout, mergeGuestCart, message, params, save, signedIn, type Row, type SearchGroups, type SearchResponse } from './api';
   import { CursorPager } from './cursor-pager.svelte';
   import CursorMore from './CursorMore.svelte';
+  import CategoryNav from './CategoryNav.svelte';
   import ProductGrid from './ProductGrid.svelte';
   import SearchBar from './SearchBar.svelte';
   import Fields, {type Field} from './Fields.svelte';
@@ -19,13 +20,10 @@
   const storefrontHome = page === '' && !category;
   let account = $state<Row|null>(null), cartCount = $state(guestCart().reduce((sum,row)=>sum+row.quantity,0));
   let searchGroups = $state.raw<SearchGroups>({ products: [], shops: [] });
-  let categories = $state<Row[]>([]);
   const pager = new CursorPager<Row & {id:number}, number | string>();
   let sort = $state<'for-you' | 'newest' | 'oldest'>(storefrontHome ? 'for-you' : 'newest');
   let hasForYou = $state(storefrontHome);
   let busy=$state(browse), error=$state(''), authNotice=$state('');
-  const icons = [{name:'All products',icon:LayoutGrid},{name:'Fashion',icon:Shirt},{name:'Electronics',icon:Headphones},{name:'Home & Living',icon:House},{name:'Beauty',icon:Sparkles},{name:'Sports',icon:Volleyball},{name:'Food & Drink',icon:Coffee}];
-  const publicLinks = $derived([...icons,...categories.filter(c=>c.kind==='category'&&!icons.some(i=>i.name===c.name)).map(c=>({name:String(c.name),icon:Package}))]);
   const prefix = portal==='customer'?'':'/'+portal;
   const email: Field = {name:'email',label:'Email address',type:'email'};
   const password: Field = {name:'password',label:'Password',type:'password'};
@@ -86,7 +84,6 @@
     if (page === 'checkout') window.addEventListener('beforeunload', checkoutLeave);
     if(browse) {
       void load();
-      api<Row[]>('/categories').then(value=>categories=value).catch(()=>{});
     }
     if(signedIn()) {
       api('/auth/me').then(value=>account=value).catch(()=>{});
@@ -137,9 +134,7 @@
     </div>
   </div>
   {#if portal==='customer' && !authPage}
-    <nav class="category-bar" aria-label="Shop categories"><div class="wrap categories">
-      {#each publicLinks as entry,i (entry.name)}<a class:active={(i===0&&!category&&page==='')||entry.name===category} href={i===0?'/':'/'+params({category:entry.name})+'#catalog'}><entry.icon size={16}/>{entry.name}</a>{/each}
-    </div></nav>
+    <CategoryNav {category} {storefrontHome} />
   {/if}
 </header>
 

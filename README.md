@@ -16,6 +16,34 @@ The backend uses the already-running MariaDB and Meilisearch services at `127.0.
 3. In `backend/`, run `cargo run`.
 4. In a second terminal, run `bun install` and `bun run dev` from `frontend/`. Open [the development storefront](http://127.0.0.1:5173). Alternatively, `bun run build` produces the frontend that Axum serves at [127.0.0.1:8080](http://127.0.0.1:8080).
 
+## Import the Amazon catalog for load testing
+
+Put `amazon_products.csv` and `amazon_categories.csv` in the repository root. From the root, run the PowerShell script to import into local MariaDB database `tosca_market_amazon` with Meilisearch index suffix `_amazon`. If your local credentials differ from the development defaults, pass `-DatabaseUrl` with the correct connection URL. Use a distinct `-IndexSuffix` if you choose a different database.
+
+```powershell
+.\backend\import-amazon.ps1
+```
+
+The importer creates one benchmark shop and an active listing with a standard variant for each CSV row. It commits at most 5,000 products, their variants, and their search jobs in one transaction. Rerun the same command after an interruption to resume from the last commit and finish syncing Meilisearch. Use `-Limit 10000` to load up to 10,000 products total, then omit the limit to finish. Keep the source CSV files unchanged between runs.
+
+Prices use a fixed benchmark conversion of Rp16,000 per USD. A missing sale price uses the list price when available. Rows with neither price use a Rp10,000 placeholder and zero stock. Other variants have fixture stock of 30 and a weight of 500 g. Product names use the schema's 180-character limit, with the complete title kept in the description when shortened. Images are blank so the storefront shows product initials.
+
+After the import reports success, start the benchmark API from `backend/` with the same database and search indexes.
+
+```powershell
+$env:DATABASE_URL = 'mysql://root:root@127.0.0.1:3306/tosca_market_amazon'
+$env:MEILI_INDEX_SUFFIX = '_amazon'
+$env:SEMANTIC_SEARCH_ENABLED = 'false'
+$env:RECOMMENDATIONS_ENABLED = 'false'
+$env:DEMO_CATALOG = 'false'
+$env:BIND = '127.0.0.1:8086'
+cargo run --release --locked
+```
+
+If `frontend/dist` has been built, the backend serves the storefront at http://127.0.0.1:8086. For the search stress harness, use `http://127.0.0.1:8086/api/search`. With recommendations enabled, the app refreshes Stoolap from MariaDB on its normal schedule.
+
+Source: Asaniczka, [Amazon Products Dataset 2023 (1.4M Products)](https://doi.org/10.34740/kaggle/ds/3798081), [Open Data Commons Attribution License](https://opendatacommons.org/licenses/by/1-0/).
+
 ## Seed the test marketplace
 
 With `backend/.env` configured for your local database, run this from `backend/`.
@@ -87,7 +115,7 @@ To compare builds, run the same command against each backend with the same seed,
 ## Recommendations and semantic search
 
 - Set `RECOMMENDATIONS_ENABLED=true` to enable **For you** in Explore products and related recommendations on product pages. The recommendations API accepts an optional `product_id` context, `category_id`, `shop_id`, `min_price`, `max_price`, and `sort` (`relevance`, `newest`, `price_asc`, or `price_desc`). Recommendation results are private and excluded from HTTP caching.
-- Each Axum process owns a Stoolap directory under its operating-system temporary directory. Give each pod writable temporary space. The catalog snapshot and rankings expire after 60 seconds. MariaDB checks current availability and price before cards are returned, and serves a basic recommendation list while a pod refreshes. Guest activity lives in the same browser for 30 days. Account view and cart signals are retained in MariaDB for 90 days.
+- Each Axum process keeps a private Stoolap snapshot in its operating-system temporary directory. The snapshot includes up to 96 recent listings per category, up to 96 recent listings across the catalog, and up to 96 products from each of the sales and views leaderboards. Older products in a viewer's history can still inform ranking. The snapshot and rankings expire after 60 seconds. MariaDB checks current availability and price before returning cards and fills pages that have too few recommendations. Guest activity lives in the same browser for 30 days. Account view and cart signals are retained in MariaDB for 90 days.
 - On the storefront home, Explore products defaults to **For you**, which lists shopper preferences first, then products trending over the past seven days, then the rest of the catalog newest first. Shoppers can switch to **Newest** for chronological browsing. Guest views contribute to aggregate product counts without sending a browser identifier. The feed uses a signed cursor so shoppers can continue scrolling across backend replicas.
 - Set `SEMANTIC_SEARCH_ENABLED=true` to blend semantic and keyword results for products in autocomplete and submitted search. Product search uses keywords if the embedding model is unavailable or takes more than one second, including time spent waiting for the model. Shop search and explicit `suggest=true` requests use keywords. Either flag starts the local Multilingual E5 Small model and a worker that fills missing catalog embeddings. The Hugging Face cache can be prewarmed and specified with `HF_HOME`. Inspect startup logs for `local text embedder ready` and `product_embeddings.next_attempt_at` for pending backfill work.
 - Leave Stoolap disabled by default while benchmarking. In a multi-pod deployment, use the same MariaDB URL, Meilisearch index suffix, and feature settings across replicas. Each pod builds its cache independently.

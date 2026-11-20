@@ -52,7 +52,37 @@ async fn member(app: &App, user: &User, shop: i64, owner: bool) -> Result<()> {
     }
     Ok(())
 }
-const PRODUCT: &str = "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'description',p.description,'status',p.status,'note',p.note,'brand',b.name,'category',c.name,'shop',s.name,'created_at',p.created_at,'actor',u.name,'lowest_price',(SELECT MIN(price) FROM variants WHERE product_id=p.id AND enabled),'stock',COALESCE((SELECT SUM(stock) FROM variants WHERE product_id=p.id AND enabled),0),'recent_sold',COALESCE((SELECT SUM(l.quantity) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE l.product_id=p.id AND o.completed_at>=UTC_TIMESTAMP()-INTERVAL 28 DAY),0),'sold',COALESCE((SELECT SUM(l.quantity) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE l.product_id=p.id AND o.completed_at IS NOT NULL),0)) FROM products p JOIN shops s ON s.id=p.shop_id JOIN users u ON u.id=p.actor_id LEFT JOIN taxonomy b ON b.id=p.brand_id LEFT JOIN taxonomy c ON c.id=p.category_id";
+const PRODUCT_SELECT: &str = "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'description',p.description,'status',p.status,'note',p.note,'brand',b.name,'category',c.name,'shop',s.name,'created_at',p.created_at,'actor',u.name,'lowest_price',(SELECT MIN(price) FROM variants WHERE product_id=p.id AND enabled),'stock',COALESCE((SELECT SUM(stock) FROM variants WHERE product_id=p.id AND enabled),0),'recent_sold',COALESCE((SELECT SUM(l.quantity) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE l.product_id=p.id AND o.completed_at>=UTC_TIMESTAMP()-INTERVAL 28 DAY),0),'sold',COALESCE((SELECT SUM(l.quantity) FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE l.product_id=p.id AND o.completed_at IS NOT NULL),0))";
+const PRODUCT_JOINS: &str = " JOIN shops s ON s.id=p.shop_id JOIN users u ON u.id=p.actor_id LEFT JOIN taxonomy b ON b.id=p.brand_id LEFT JOIN taxonomy c ON c.id=p.category_id";
+
+fn product_page_query(index: &'static str) -> sqlx::QueryBuilder<MySql> {
+    let mut query = sqlx::QueryBuilder::new(PRODUCT_SELECT);
+    query
+        .push(" FROM (SELECT p.id FROM products p FORCE INDEX (")
+        .push(index)
+        .push(")");
+    query
+}
+
+async fn product_page(
+    db: &MySqlPool,
+    mut query: sqlx::QueryBuilder<MySql>,
+    sort: &'static str,
+    limit: u32,
+) -> Result<Vec<String>> {
+    // Perform stock and sales lookups only for the listings on this page.
+    query
+        .push(" ORDER BY p.id ")
+        .push(sort)
+        .push(" LIMIT ")
+        .push_bind(limit)
+        .push(") page STRAIGHT_JOIN products p FORCE INDEX (PRIMARY) ON p.id=page.id")
+        .push(PRODUCT_JOINS)
+        .push(" ORDER BY p.id ")
+        .push(sort);
+    Ok(query.build_query_scalar().fetch_all(db).await?)
+}
+
 async fn products(
     State(app): State<App>,
     user: User,
@@ -60,21 +90,28 @@ async fn products(
     Query(f): Query<Filter>,
 ) -> Result {
     member(&app, &user, shop, false).await?;
-    let status = f.status.unwrap_or_default();
-    let pattern = format!("%{}%", f.q.unwrap_or_default());
-    let sql = format!(
-        "{PRODUCT} WHERE p.shop_id=? AND p.id<? AND p.name LIKE ? AND (?='' OR p.status=?) ORDER BY p.id DESC LIMIT 21"
-    );
-    Ok(catalog::page(decode_rows(
-        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(shop)
-            .bind(f.cursor.unwrap_or(i64::MAX))
-            .bind(pattern)
-            .bind(&status)
-            .bind(&status)
-            .fetch_all(&app.db)
-            .await?,
-    )?))
+    let status = f.status.as_deref().filter(|status| !status.is_empty());
+    let index = if status.is_some() {
+        "product_shop_status_id"
+    } else {
+        "shop_id"
+    };
+    let mut query = product_page_query(index);
+    query
+        .push(" WHERE p.shop_id=")
+        .push_bind(shop)
+        .push(" AND p.id<")
+        .push_bind(f.cursor.unwrap_or(i64::MAX));
+    if let Some(status) = status {
+        query.push(" AND p.status=").push_bind(status);
+    }
+    if let Some(search) = f.q.as_deref().filter(|q| !q.is_empty()) {
+        query
+            .push(" AND p.name LIKE ")
+            .push_bind(format!("%{search}%"));
+    }
+    let rows = product_page(&app.db, query, "DESC", 21).await?;
+    Ok(catalog::page(decode_rows(rows)?))
 }
 fn period(value: Option<&str>) -> (&'static str, i32) {
     match value {
@@ -115,7 +152,7 @@ async fn product(
 ) -> Result {
     member(&app, &user, shop, false).await?;
     let raw: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "{PRODUCT} WHERE p.id=? AND p.shop_id=?"
+        "{PRODUCT_SELECT} FROM products p{PRODUCT_JOINS} WHERE p.id=? AND p.shop_id=?"
     )))
     .bind(id)
     .bind(shop)
@@ -132,8 +169,9 @@ async fn product(
         "DESC"
     };
     let sql = format!(
-        "{} WHERE o.shop_id=? AND EXISTS(SELECT 1 FROM order_lines l WHERE l.order_id=o.id AND l.product_id=?) ORDER BY o.created_at {sort},o.id {sort} LIMIT 100",
-        commerce::ORDER
+        "{} FROM orders o{} WHERE o.shop_id=? AND EXISTS(SELECT 1 FROM order_lines l WHERE l.order_id=o.id AND l.product_id=?) ORDER BY o.created_at {sort},o.id {sort} LIMIT 100",
+        commerce::ORDER_SELECT,
+        commerce::ORDER_JOINS,
     );
     item["orders"] = json!(decode_rows(
         sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
@@ -317,28 +355,99 @@ async fn update_variant(
         .bind(input.name.trim()).bind(input.subvariant.trim()).bind(input.price).bind(input.stock).bind(input.grams).bind(input.enabled).bind(user.id).bind(variant).bind(id).bind(shop).execute(&app.db).await?;
     Ok(ok())
 }
-async fn orders_list(app: &App, shop: i64, f: Filter, priority: bool) -> Result<Vec<Value>> {
-    let sort = if priority {
-        "(o.status='waiting_shop') DESC,o.created_at DESC,o.id DESC"
-    } else {
-        "o.created_at DESC,o.id DESC"
+enum OrderStatus<'a> {
+    Any,
+    Exact(&'a str),
+    ExceptWaiting,
+}
+
+async fn order_page(
+    db: &MySqlPool,
+    shop: i64,
+    before: Option<(chrono::NaiveDateTime, i64)>,
+    status: OrderStatus<'_>,
+    limit: u32,
+) -> Result<Vec<Value>> {
+    let index = match status {
+        OrderStatus::Exact(_) => "order_shop_status_date",
+        _ => "order_shop_date",
     };
-    let sql = format!(
-        "{} WHERE o.shop_id=? AND (? IS NULL OR (o.created_at,o.id)<(SELECT created_at,id FROM orders WHERE id=? AND shop_id=?)) AND (?='' OR o.status=?) ORDER BY {sort} LIMIT 21",
-        commerce::ORDER
-    );
-    let status = f.status.unwrap_or_default();
-    decode_rows(
-        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+    let mut query = sqlx::QueryBuilder::new(commerce::ORDER_SELECT);
+    query
+        .push(" FROM (SELECT id FROM orders FORCE INDEX (")
+        .push(index)
+        .push(") WHERE shop_id=")
+        .push_bind(shop);
+    match status {
+        OrderStatus::Exact(status) => {
+            query.push(" AND status=").push_bind(status);
+        }
+        OrderStatus::ExceptWaiting => {
+            query.push(" AND status<>'waiting_shop'");
+        }
+        OrderStatus::Any => {}
+    }
+    commerce::before_date(&mut query, before);
+    query
+        .push(" ORDER BY created_at DESC,id DESC LIMIT ")
+        .push_bind(limit)
+        .push(") page STRAIGHT_JOIN orders o FORCE INDEX (PRIMARY) ON o.id=page.id")
+        .push(commerce::ORDER_JOINS)
+        .push(" ORDER BY o.created_at DESC,o.id DESC");
+    decode_rows(query.build_query_scalar().fetch_all(db).await?)
+}
+
+async fn orders_list(app: &App, shop: i64, f: Filter, priority: bool) -> Result<Vec<Value>> {
+    let before = if let Some(id) = f.cursor {
+        let position = sqlx::query_as("SELECT created_at,id FROM orders WHERE id=? AND shop_id=?")
+            .bind(id)
             .bind(shop)
-            .bind(f.cursor)
-            .bind(f.cursor)
-            .bind(shop)
-            .bind(&status)
-            .bind(&status)
-            .fetch_all(&app.db)
-            .await?,
+            .fetch_optional(&app.db)
+            .await?;
+        let Some(position) = position else {
+            return Ok(Vec::new());
+        };
+        Some(position)
+    } else {
+        None
+    };
+    const LIMIT: u32 = 21;
+    if let Some(status) = f.status.as_deref().filter(|status| !status.is_empty()) {
+        return order_page(&app.db, shop, before, OrderStatus::Exact(status), LIMIT).await;
+    }
+    if !priority {
+        return order_page(&app.db, shop, before, OrderStatus::Any, LIMIT).await;
+    }
+
+    // The dashboard puts waiting orders first. Read that page from its own index range.
+    let mut orders = order_page(
+        &app.db,
+        shop,
+        before,
+        OrderStatus::Exact("waiting_shop"),
+        LIMIT,
     )
+    .await?;
+    if orders.len() < LIMIT as usize {
+        // An order can leave waiting_shop between the two reads.
+        let remaining = LIMIT as usize - orders.len();
+        let waiting_ids: Vec<_> = orders
+            .iter()
+            .filter_map(|order| order["id"].as_i64())
+            .collect();
+        let others = order_page(&app.db, shop, before, OrderStatus::ExceptWaiting, LIMIT).await?;
+        orders.extend(
+            others
+                .into_iter()
+                .filter(|order| {
+                    order["id"]
+                        .as_i64()
+                        .is_some_and(|id| !waiting_ids.contains(&id))
+                })
+                .take(remaining),
+        );
+    }
+    Ok(orders)
 }
 async fn orders(
     State(app): State<App>,
@@ -352,8 +461,9 @@ async fn orders(
 async fn order(State(app): State<App>, user: User, Path((shop, id)): Path<(i64, i64)>) -> Result {
     member(&app, &user, shop, false).await?;
     let raw = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "{} WHERE o.shop_id=? AND o.id=?",
-        commerce::ORDER
+        "{} FROM orders o{} WHERE o.shop_id=? AND o.id=?",
+        commerce::ORDER_SELECT,
+        commerce::ORDER_JOINS,
     )))
     .bind(shop)
     .bind(id)
@@ -577,7 +687,38 @@ async fn shop_dash(
     member(&app, &user, shop, false).await?;
     let (format, days) = period(f.sort.as_deref());
     let sales = series(&app, format, days, shop, 0).await?;
-    let stock=decode_rows(sqlx::query_scalar("SELECT JSON_OBJECT('label',health,'value',COUNT(*)) FROM (SELECT CASE WHEN p.status='pending' THEN 'On review' WHEN p.status<>'active' THEN 'Inactive' WHEN COALESCE(stock,0)=0 THEN 'Out of stock' WHEN stock<=GREATEST(1,COALESCE(sold,0)/4) THEN 'Low stock' ELSE 'Healthy' END AS health FROM products p LEFT JOIN (SELECT product_id,SUM(stock) stock FROM variants WHERE enabled GROUP BY product_id) v ON v.product_id=p.id LEFT JOIN (SELECT l.product_id,SUM(l.quantity) sold FROM order_lines l JOIN orders o ON o.id=l.order_id WHERE o.completed_at>=UTC_TIMESTAMP()-INTERVAL 28 DAY GROUP BY l.product_id) x ON x.product_id=p.id WHERE p.shop_id=?) z GROUP BY health").bind(shop).fetch_all(&app.db).await?)?;
+    let stock = decode_rows(
+        sqlx::query_scalar(
+            "SELECT JSON_OBJECT('label',health,'value',COUNT(*))
+             FROM (
+                SELECT CASE
+                    WHEN p.status='pending' THEN 'On review'
+                    WHEN p.status<>'active' THEN 'Inactive'
+                    ELSE (
+                        SELECT CASE
+                            WHEN COALESCE(SUM(v.stock),0)=0 THEN 'Out of stock'
+                            WHEN SUM(v.stock)<=GREATEST(1,COALESCE(sales.sold,0)/4) THEN 'Low stock'
+                            ELSE 'Healthy'
+                        END
+                        FROM variants v WHERE v.product_id=p.id AND v.enabled
+                    )
+                END AS health
+                FROM products p FORCE INDEX (product_shop_status_id)
+                LEFT JOIN (
+                    SELECT l.product_id,SUM(l.quantity) sold
+                    FROM orders o JOIN order_lines l ON l.order_id=o.id
+                    JOIN products sold_product ON sold_product.id=l.product_id AND sold_product.shop_id=?
+                    WHERE o.completed_at>=UTC_TIMESTAMP()-INTERVAL 28 DAY
+                    GROUP BY l.product_id
+                ) sales ON sales.product_id=p.id
+                WHERE p.shop_id=?
+             ) inventory GROUP BY health",
+        )
+        .bind(shop)
+        .bind(shop)
+        .fetch_all(&app.db)
+        .await?,
+    )?;
     Ok(Json(
         json!({"sales":sales,"stock":stock,"orders":orders_list(&app,shop,f,true).await?}),
     ))
@@ -594,14 +735,11 @@ async fn admin_dash(State(app): State<App>, user: User, Query(f): Query<Filter>)
     } else {
         "ASC"
     };
-    let products = decode_rows(
-        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "{PRODUCT} WHERE p.status='pending' AND p.name LIKE ? ORDER BY p.id {sort} LIMIT 15"
-        )))
-        .bind(&pattern)
-        .fetch_all(&app.db)
-        .await?,
-    )?;
+    let mut query = product_page_query("status");
+    query
+        .push(" WHERE p.status='pending' AND p.name LIKE ")
+        .push_bind(&pattern);
+    let products = decode_rows(product_page(&app.db, query, sort, 15).await?)?;
     let taxonomy = decode_rows(
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "{TAXONOMY} WHERE status='pending' AND name LIKE ? ORDER BY id {sort} LIMIT 15"
@@ -627,7 +765,7 @@ async fn admin_list(
     Query(f): Query<Filter>,
 ) -> Result {
     user.admin()?;
-    let pattern = format!("%{}%", f.q.unwrap_or_default());
+    let pattern = format!("%{}%", f.q.as_deref().unwrap_or(""));
     let status = f.status.unwrap_or_default();
     let sort = if f.sort.as_deref() == Some("oldest") {
         "ASC"
@@ -635,7 +773,19 @@ async fn admin_list(
         "DESC"
     };
     let values=match section.as_str() {
-        "products"=>sqlx::query_scalar(sqlx::AssertSqlSafe(format!("{PRODUCT} WHERE CONCAT_WS(' ',p.name,s.name) LIKE ? AND (?='' OR p.status=?) ORDER BY p.id {sort} LIMIT 100"))).bind(&pattern).bind(&status).bind(&status).fetch_all(&app.db).await?,
+        "products" => {
+            let mut query = product_page_query(if status.is_empty() { "PRIMARY" } else { "status" });
+            if f.q.as_deref().is_some_and(|q| !q.is_empty()) {
+                query.push(" STRAIGHT_JOIN shops s FORCE INDEX (PRIMARY) ON s.id=p.shop_id WHERE CONCAT_WS(' ',p.name,s.name) LIKE ")
+                    .push_bind(&pattern);
+            } else {
+                query.push(" WHERE TRUE");
+            }
+            if !status.is_empty() {
+                query.push(" AND p.status=").push_bind(&status);
+            }
+            product_page(&app.db, query, sort, 100).await?
+        }
         "taxonomy"=>sqlx::query_scalar(sqlx::AssertSqlSafe(format!("{TAXONOMY} WHERE name LIKE ? AND (?='' OR status=?) ORDER BY id {sort} LIMIT 100"))).bind(&pattern).bind(&status).bind(&status).fetch_all(&app.db).await?,
         "users"=>sqlx::query_scalar("SELECT JSON_OBJECT('id',id,'name',name,'email',email,'admin',admin,'suspended',suspended) FROM users WHERE CONCAT_WS(' ',name,email) LIKE ? ORDER BY id DESC LIMIT 100").bind(&pattern).fetch_all(&app.db).await?,
         "shops"=>sqlx::query_scalar("SELECT JSON_OBJECT('id',s.id,'name',s.name,'owner',u.name,'suspended',s.suspended) FROM shops s JOIN users u ON u.id=s.owner_id WHERE s.name LIKE ? ORDER BY s.id DESC LIMIT 100").bind(&pattern).fetch_all(&app.db).await?,

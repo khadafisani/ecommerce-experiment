@@ -358,24 +358,59 @@ async fn checkout(State(app): State<App>, user: User, Json(input): Json<Checkout
     Ok(Json(json!({"id":id})))
 }
 const SUMMARY: &str = "SELECT JSON_OBJECT('id',c.id,'checkout_no',c.checkout_no,'created_at',c.created_at,'address',c.address,'subtotal',c.subtotal,'tax',c.tax,'shipping',c.shipping,'total',c.total,'payment',c.payment,'status',CASE WHEN c.payment='cancelled' THEN 'Cancelled' WHEN c.payment='waiting' THEN 'Waiting for payment' WHEN EXISTS(SELECT 1 FROM orders o WHERE o.checkout_id=c.id AND o.status='waiting_shop') THEN IF(EXISTS(SELECT 1 FROM orders o WHERE o.checkout_id=c.id AND o.status<>'waiting_shop'),'Progress partially','Waiting shop response') WHEN NOT EXISTS(SELECT 1 FROM orders o WHERE o.checkout_id=c.id AND o.status NOT IN ('rejected','completed','return_review','return_accepted','return_rejected','return_completed')) THEN IF(EXISTS(SELECT 1 FROM orders o WHERE o.checkout_id=c.id AND o.status<>'rejected'),'Completed','Progress') WHEN EXISTS(SELECT 1 FROM orders o WHERE o.checkout_id=c.id AND o.status='delivery') THEN IF(EXISTS(SELECT 1 FROM orders o WHERE o.checkout_id=c.id AND o.status='packing'),'Partially on delivery','On delivery') ELSE 'Progress' END) FROM checkouts c";
-async fn checkouts(State(app): State<App>, user: User, Query(f): Query<Filter>) -> Result {
-    let pattern = format!("%{}%", f.q.as_deref().unwrap_or(""));
-    let sql = format!(
-        "{SUMMARY} WHERE c.user_id=? AND (? IS NULL OR (c.created_at,c.id)<(SELECT created_at,id FROM checkouts WHERE id=? AND user_id=?)) AND (CONCAT_WS(' ',c.checkout_no,c.address,c.total,c.created_at,c.payment) LIKE ? OR EXISTS(SELECT 1 FROM orders o JOIN shops s ON s.id=o.shop_id JOIN order_lines l ON l.order_id=o.id WHERE o.checkout_id=c.id AND CONCAT_WS(' ',s.name,o.status,o.receipt,l.product_name,l.variant_name) LIKE ?)) ORDER BY c.created_at DESC,c.id DESC LIMIT 21"
-    );
-    Ok(catalog::page(decode_rows(
-        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(user.id)
-            .bind(f.cursor)
-            .bind(f.cursor)
-            .bind(user.id)
-            .bind(&pattern)
-            .bind(&pattern)
-            .fetch_all(&app.db)
-            .await?,
-    )?))
+
+pub(super) fn before_date(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    cursor: Option<(chrono::NaiveDateTime, i64)>,
+) {
+    if let Some((created_at, id)) = cursor {
+        query
+            .push(" AND (created_at<")
+            .push_bind(created_at)
+            .push(" OR (created_at=")
+            .push_bind(created_at)
+            .push(" AND id<")
+            .push_bind(id)
+            .push("))");
+    }
 }
-pub const ORDER: &str = "SELECT JSON_OBJECT('id',o.id,'checkout_id',o.checkout_id,'shop',s.name,'subtotal',o.subtotal,'shipping',o.shipping,'tax',o.tax,'status',o.status,'receipt',o.receipt,'courier',co.name,'courier_id',co.id,'courier_url',co.url,'created_at',o.created_at,'completed_at',o.completed_at,'returnable',IF(o.status='completed' AND o.completed_at>=UTC_TIMESTAMP()-INTERVAL 14 DAY,1,0),'actor',u.name) FROM orders o JOIN shops s ON s.id=o.shop_id JOIN users u ON u.id=o.actor_id LEFT JOIN couriers co ON co.id=o.courier_id";
+
+async fn checkouts(State(app): State<App>, user: User, Query(f): Query<Filter>) -> Result {
+    let before = if let Some(id) = f.cursor {
+        let position =
+            sqlx::query_as("SELECT created_at,id FROM checkouts WHERE id=? AND user_id=?")
+                .bind(id)
+                .bind(user.id)
+                .fetch_optional(&app.db)
+                .await?;
+        let Some(position) = position else {
+            return Ok(catalog::page(Vec::new()));
+        };
+        Some(position)
+    } else {
+        None
+    };
+    let mut query = sqlx::QueryBuilder::new(SUMMARY);
+    query
+        .push(" FORCE INDEX (checkout_user_date) WHERE c.user_id=")
+        .push_bind(user.id);
+    before_date(&mut query, before);
+    if let Some(search) = f.q.as_deref().filter(|q| !q.is_empty()) {
+        let pattern = format!("%{search}%");
+        query.push(" AND (CONCAT_WS(' ',c.checkout_no,c.address,c.total,c.created_at,c.payment) LIKE ")
+            .push_bind(pattern.clone())
+            .push(" OR EXISTS(SELECT 1 FROM orders o JOIN shops s ON s.id=o.shop_id
+                 JOIN order_lines l ON l.order_id=o.id WHERE o.checkout_id=c.id
+                   AND CONCAT_WS(' ',s.name,o.status,o.receipt,l.product_name,l.variant_name) LIKE ")
+            .push_bind(pattern)
+            .push("))");
+    }
+    query.push(" ORDER BY c.created_at DESC,c.id DESC LIMIT 21");
+    let values = query.build_query_scalar().fetch_all(&app.db).await?;
+    Ok(catalog::page(decode_rows(values)?))
+}
+pub(super) const ORDER_SELECT: &str = "SELECT JSON_OBJECT('id',o.id,'checkout_id',o.checkout_id,'shop',s.name,'subtotal',o.subtotal,'shipping',o.shipping,'tax',o.tax,'status',o.status,'receipt',o.receipt,'courier',co.name,'courier_id',co.id,'courier_url',co.url,'created_at',o.created_at,'completed_at',o.completed_at,'returnable',IF(o.status='completed' AND o.completed_at>=UTC_TIMESTAMP()-INTERVAL 14 DAY,1,0),'actor',u.name)";
+pub(super) const ORDER_JOINS: &str = " JOIN shops s ON s.id=o.shop_id JOIN users u ON u.id=o.actor_id LEFT JOIN couriers co ON co.id=o.courier_id";
 pub async fn populate(app: &App, mut order: Value) -> Result<Value> {
     let id = order["id"]
         .as_i64()
@@ -401,7 +436,7 @@ async fn detail(State(app): State<App>, user: User, Path(id): Path<i64>) -> Resu
     let mut orders = vec![];
     for order in decode_rows(
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "{ORDER} WHERE o.checkout_id=? ORDER BY o.id"
+            "{ORDER_SELECT} FROM orders o{ORDER_JOINS} WHERE o.checkout_id=? ORDER BY o.id"
         )))
         .bind(id)
         .fetch_all(&app.db)

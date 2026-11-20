@@ -81,7 +81,8 @@ pub async fn enqueue(conn: &mut MySqlConnection, products: &[i64]) -> anyhow::Re
     query.push(
         " ON DUPLICATE KEY UPDATE
          embedding=IF(model<>VALUES(model) OR fingerprint<>VALUES(fingerprint),NULL,embedding),
-         next_attempt_at=IF(model<>VALUES(model) OR fingerprint<>VALUES(fingerprint),UTC_TIMESTAMP(6),next_attempt_at),
+         next_attempt_at=IF(model<>VALUES(model) OR fingerprint<>VALUES(fingerprint)
+                            OR (embedding IS NULL AND next_attempt_at IS NULL),UTC_TIMESTAMP(6),next_attempt_at),
          model=VALUES(model),fingerprint=VALUES(fingerprint)",
     );
     query.build().execute(conn).await?;
@@ -92,7 +93,7 @@ pub async fn enqueue(conn: &mut MySqlConnection, products: &[i64]) -> anyhow::Re
 struct Pending {
     product_id: i64,
     fingerprint: String,
-    passage: String,
+    passage: Option<String>,
 }
 
 async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> {
@@ -108,20 +109,58 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
         return Ok(false);
     }
     let jobs: Vec<Pending> = sqlx::query_as(
-        "SELECT e.product_id,e.fingerprint,t.passage FROM product_embeddings e
-         JOIN recommendation_product_text t ON t.id=e.product_id AND SHA2(t.passage,256)=e.fingerprint
+        "SELECT e.product_id,e.fingerprint,
+            (SELECT t.passage FROM recommendation_product_text t
+             WHERE t.id=e.product_id AND SHA2(t.passage,256)=e.fingerprint) AS passage
+         FROM product_embeddings e FORCE INDEX (embedding_due)
          WHERE e.model=? AND e.next_attempt_at<=UTC_TIMESTAMP(6)
          ORDER BY e.next_attempt_at,e.product_id LIMIT 8",
-    ).bind(MODEL).fetch_all(&mut connection).await?;
+    )
+    .bind(MODEL)
+    .fetch_all(&mut connection)
+    .await?;
     if jobs.is_empty() {
         return Ok(false);
     }
-    let passages: Vec<_> = jobs.iter().map(|job| job.passage.clone()).collect();
-    let mut model = Arc::clone(model).lock_owned().await;
-    let vectors = tokio::task::spawn_blocking(move || model.embed(passages, Some(8))).await??;
-    anyhow::ensure!(vectors.len() == jobs.len(), "Embedding batch size mismatch");
-    for (job, vector) in jobs.into_iter().zip(vectors) {
+    let passages: Vec<_> = jobs.iter().filter_map(|job| job.passage.clone()).collect();
+    let mut vectors = if passages.is_empty() {
+        Vec::new().into_iter()
+    } else {
+        let count = passages.len();
+        let mut model = Arc::clone(model).lock_owned().await;
+        let vectors = tokio::task::spawn_blocking(move || model.embed(passages, Some(8))).await??;
+        anyhow::ensure!(vectors.len() == count, "Embedding batch size mismatch");
+        vectors.into_iter()
+    };
+    for job in jobs {
+        let vector = job.passage.as_ref().and_then(|_| vectors.next());
         let mut tx = connection.begin().await?;
+        // Read and lock the current versioned rows before updating the queue row.
+        // MariaDB can hide those rows when the view is read inside UPDATE.
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT SHA2(passage,256) FROM recommendation_product_text WHERE id=? FOR UPDATE",
+        )
+        .bind(job.product_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if current.as_deref() != Some(job.fingerprint.as_str()) {
+            // enqueue() will requeue this row if the product becomes eligible again.
+            sqlx::query(
+                "UPDATE product_embeddings SET next_attempt_at=NULL
+                 WHERE product_id=? AND model=? AND fingerprint=? AND next_attempt_at IS NOT NULL",
+            )
+            .bind(job.product_id)
+            .bind(MODEL)
+            .bind(&job.fingerprint)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            continue;
+        }
+        let Some(vector) = vector else {
+            tx.commit().await?;
+            continue;
+        };
         if !valid_vector(&vector) {
             sqlx::query(
                 "UPDATE product_embeddings SET next_attempt_at=UTC_TIMESTAMP(6)+INTERVAL 60 SECOND
@@ -137,14 +176,11 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
         }
         let updated = sqlx::query(
             "UPDATE product_embeddings SET embedding=?,next_attempt_at=NULL
-             WHERE product_id=? AND model=? AND fingerprint=? AND next_attempt_at IS NOT NULL
-               AND EXISTS(SELECT 1 FROM recommendation_product_text t
-                          WHERE t.id=product_embeddings.product_id AND SHA2(t.passage,256)=?)",
+             WHERE product_id=? AND model=? AND fingerprint=? AND next_attempt_at IS NOT NULL",
         )
         .bind(sqlx::types::Json(vector))
         .bind(job.product_id)
         .bind(MODEL)
-        .bind(&job.fingerprint)
         .bind(&job.fingerprint)
         .execute(&mut *tx)
         .await?;

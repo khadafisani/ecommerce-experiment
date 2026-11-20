@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Context;
-use sqlx::MySqlPool;
+use sqlx::{MySql, MySqlPool, QueryBuilder};
 use stoolap::{Database, Value};
 
 use super::{CANDIDATES, DAY, Filters, Signal, SignalKind, Sort, TTL};
@@ -13,6 +13,8 @@ use crate::embeddings::{DIMENSIONS, MODEL};
 
 const MAX_RANKINGS: i64 = 512;
 const EXPLORE_TIER_SIZE: usize = CANDIDATES / 2;
+const CATEGORY_QUERY_BATCH: usize = 32;
+const PRODUCT_QUERY_BATCH: usize = 512;
 
 #[derive(Default)]
 pub(super) struct Cache(Mutex<Option<Projection>>);
@@ -43,22 +45,25 @@ pub(super) struct CatalogRow {
 }
 
 pub(super) async fn read_catalog(pool: &MySqlPool) -> anyhow::Result<Vec<CatalogRow>> {
-    Ok(sqlx::query_as(
-        "SELECT p.id,p.category_id,p.shop_id,
-            (SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled AND v.stock>0) AS price,
-            COALESCE(pop.sales,0) AS popularity, COALESCE(trend.views,0) AS trend_views, e.embedding
-         FROM products p JOIN shops s ON s.id=p.shop_id
-         LEFT JOIN recommendation_product_text t ON t.id=p.id
-         LEFT JOIN product_embeddings e ON e.product_id=p.id AND e.model=? AND e.fingerprint=SHA2(t.passage,256)
-         LEFT JOIN (
-            SELECT l.product_id,COUNT(DISTINCT c.id) AS sales
+    let categories =
+        sqlx::query_scalar::<_, i64>("SELECT id FROM taxonomy WHERE kind='category' ORDER BY id");
+    let newest = sqlx::query_scalar::<_, i64>(
+        "SELECT p.id FROM products p FORCE INDEX (status)
+         WHERE p.status='active' AND (SELECT s.suspended FROM shops s WHERE s.id=p.shop_id)=0
+         ORDER BY p.id DESC LIMIT ?",
+    )
+    .bind(CANDIDATES as u32);
+    let sales = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT l.product_id,COUNT(DISTINCT c.id) AS sales
             FROM checkouts c JOIN orders o ON o.checkout_id=c.id JOIN order_lines l ON l.order_id=o.id
             WHERE c.payment='paid' AND c.created_at>=UTC_TIMESTAMP()-INTERVAL 30 DAY
               AND o.status NOT IN ('rejected','cancelled')
             GROUP BY l.product_id
-         ) pop ON pop.product_id=p.id
-         LEFT JOIN (
-            SELECT product_id,CAST(SUM(views) AS SIGNED) AS views
+            ORDER BY sales DESC,l.product_id DESC LIMIT ?",
+    )
+    .bind(CANDIDATES as u32);
+    let views = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT product_id,CAST(SUM(views) AS SIGNED) AS views
             FROM (
                 SELECT product_id,COUNT(*) AS views FROM recommendation_signals
                 WHERE kind='view' AND seen_at>=UTC_TIMESTAMP()-INTERVAL 7 DAY GROUP BY product_id
@@ -66,9 +71,78 @@ pub(super) async fn read_catalog(pool: &MySqlPool) -> anyhow::Result<Vec<Catalog
                 SELECT product_id,SUM(views) FROM recommendation_guest_views
                 WHERE view_hour>=UTC_TIMESTAMP()-INTERVAL 7 DAY GROUP BY product_id
             ) activity GROUP BY product_id
-         ) trend ON trend.product_id=p.id
-         WHERE p.status='active' AND NOT s.suspended ORDER BY p.id",
-    ).bind(MODEL).fetch_all(pool).await?)
+            ORDER BY views DESC,product_id DESC LIMIT ?",
+    )
+    .bind(CANDIDATES as u32);
+    let (categories, mut ids, sales, views) = tokio::try_join!(
+        categories.fetch_all(pool),
+        newest.fetch_all(pool),
+        sales.fetch_all(pool),
+        views.fetch_all(pool),
+    )?;
+
+    // Each category uses its own ordered index range and stops at the candidate cap.
+    for batch in categories.chunks(CATEGORY_QUERY_BATCH) {
+        let mut sql = QueryBuilder::<MySql>::new("");
+        for (index, category_id) in batch.iter().enumerate() {
+            if index > 0 {
+                sql.push(" UNION ALL ");
+            }
+            sql.push(
+                "(SELECT p.id FROM products p FORCE INDEX (product_category_status_id)
+                 WHERE p.category_id=",
+            )
+            .push_bind(category_id)
+            .push(
+                " AND p.status='active' AND (SELECT s.suspended FROM shops s WHERE s.id=p.shop_id)=0
+                 ORDER BY p.id DESC LIMIT ",
+            )
+            .push_bind(CANDIDATES as u32)
+            .push(")");
+        }
+        ids.extend(sql.build_query_scalar::<i64>().fetch_all(pool).await?);
+    }
+    let sales: HashMap<_, _> = sales.into_iter().collect();
+    let views: HashMap<_, _> = views.into_iter().collect();
+    ids.extend(sales.keys().chain(views.keys()).copied());
+    let mut products = read_products(pool, ids).await?;
+    for product in &mut products {
+        product.popularity = sales.get(&product.id).copied().unwrap_or(0);
+        product.trend_views = views.get(&product.id).copied().unwrap_or(0);
+    }
+    Ok(products)
+}
+
+pub(super) async fn read_products(
+    pool: &MySqlPool,
+    mut ids: Vec<i64>,
+) -> anyhow::Result<Vec<CatalogRow>> {
+    ids.sort_unstable();
+    ids.dedup();
+    let mut products = Vec::with_capacity(ids.len());
+    for batch in ids.chunks(PRODUCT_QUERY_BATCH) {
+        let mut sql = QueryBuilder::<MySql>::new(
+            "SELECT p.id,p.category_id,p.shop_id,
+                (SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled AND v.stock>0) AS price,
+                0 AS popularity,0 AS trend_views,
+                CASE WHEN e.embedding IS NOT NULL AND e.fingerprint=(
+                    SELECT SHA2(t.passage,256) FROM recommendation_product_text t WHERE t.id=p.id
+                ) THEN e.embedding END AS embedding
+             FROM products p FORCE INDEX (PRIMARY)
+             LEFT JOIN product_embeddings e ON e.product_id=p.id AND e.model=",
+        );
+        sql.push_bind(MODEL).push(
+            " WHERE p.status='active' AND (SELECT s.suspended FROM shops s WHERE s.id=p.shop_id)=0
+              AND p.id IN (",
+        );
+        let mut params = sql.separated(",");
+        for id in batch {
+            params.push_bind(id);
+        }
+        params.push_unseparated(") ORDER BY p.id");
+        products.extend(sql.build_query_as::<CatalogRow>().fetch_all(pool).await?);
+    }
+    Ok(products)
 }
 
 impl Cache {
@@ -95,19 +169,24 @@ impl Cache {
                 }
             }
             let digest = digest.finalize().into();
-            let mut current = cache.0.lock().map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
-            if current.as_ref().is_some_and(|db| db.refreshed > started) {
-                return Ok(());
+            {
+                let mut current = cache.0.lock().map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
+                if let Some(projection) = current.as_mut() {
+                    if projection.refreshed > started {
+                        return Ok(());
+                    }
+                    if projection.catalog_digest == digest {
+                        projection.prune()?;
+                        projection.refreshed = started;
+                        return Ok(());
+                    }
+                }
             }
-            let initial = current.is_none();
-            let projection = match current.as_mut() {
-                Some(projection) => projection,
-                None => current.insert(Projection::open(started)?),
-            };
-            if projection.catalog_digest != digest {
+
+            // Readers can rank against the previous snapshot while the new one is built.
+            let mut projection = Projection::open(started)?;
+            {
                 let mut tx = projection.db.begin()?;
-                tx.execute("DELETE FROM ranked_products", ())?;
-                tx.execute("DELETE FROM catalog", ())?;
                 let insert = projection.db.prepare(
                     "INSERT INTO catalog(id,category_id,shop_id,price,popularity,trend_views,embedding)
                      VALUES ($1,$2,$3,$4,$5,$6,$7)",
@@ -119,14 +198,19 @@ impl Cache {
                     insert.execute_in(&mut tx, (row.id, row.category_id, row.shop_id, row.price, row.popularity, row.trend_views, vector))?;
                 }
                 tx.commit()?;
-                projection.catalog_digest = digest;
-            } else {
-                projection.prune()?;
             }
+            projection.catalog_digest = digest;
             projection.refreshed = started;
-            if initial {
+            let mut current = cache.0.lock().map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
+            if current.as_ref().is_some_and(|db| db.refreshed > started) {
+                return Ok(());
+            }
+            if current.is_none() {
                 tracing::info!("private Stoolap recommendation cache ready");
             }
+            let previous = current.replace(projection);
+            drop(current);
+            drop(previous);
             Ok(())
         }).await?
     }
@@ -155,6 +239,7 @@ impl Cache {
         filters: Filters,
         signals: Vec<Signal>,
         now: i64,
+        anchors: Vec<CatalogRow>,
     ) -> anyhow::Result<Option<Vec<i64>>> {
         let cache = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
@@ -168,7 +253,7 @@ impl Cache {
             if let Some(ids) = projection.lookup(&key)? {
                 return Ok(Some(ids));
             }
-            let ids = projection.calculate(&filters, signals, now)?;
+            let ids = projection.calculate(&filters, signals, now, &anchors)?;
             projection.prune()?;
             let count: i64 = projection
                 .db
@@ -245,6 +330,7 @@ impl Projection {
         filters: &Filters,
         signals: Vec<Signal>,
         now: i64,
+        anchors: &[CatalogRow],
     ) -> anyhow::Result<Vec<i64>> {
         let explore = matches!(filters.sort, Sort::Explore);
         let mut weights: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
@@ -269,23 +355,46 @@ impl Projection {
         let mut categories = HashMap::<i64, f64>::new();
         let mut centroid = vec![0.0; DIMENSIONS];
         if !weights.is_empty() {
-            let parameters: Vec<_> = weights.keys().copied().map(Value::integer).collect();
-            let sql = format!(
-                "SELECT id,category_id,embedding FROM catalog WHERE id IN ({})",
-                vec!["?"; parameters.len()].join(",")
-            );
-            for row in self.db.query(&sql, parameters)? {
-                let row = row?;
-                let id: i64 = row.get(0)?;
+            let mut add_anchor = |id: i64, category: Option<i64>, vector: Option<&[f32]>| {
                 let (product, views) = weights[&id];
-                if let Some(category) = row.get::<Option<i64>>(1)? {
+                if let Some(category) = category {
                     *categories.entry(category).or_default() +=
                         if explore { product } else { views };
                 }
-                if let Some(vector) = row.get_value(2).and_then(Value::as_vector_f32) {
+                if let Some(vector) = vector.filter(|v| {
+                    v.len() == DIMENSIONS && v.iter().all(|component| component.is_finite())
+                }) {
                     for (sum, component) in centroid.iter_mut().zip(vector) {
                         *sum += component * product as f32;
                     }
+                }
+            };
+            for anchor in anchors {
+                add_anchor(
+                    anchor.id,
+                    anchor.category_id,
+                    anchor.embedding.as_ref().map(|v| v.0.as_slice()),
+                );
+            }
+            let present: HashSet<_> = anchors.iter().map(|anchor| anchor.id).collect();
+            let parameters: Vec<_> = weights
+                .keys()
+                .filter(|id| !present.contains(id))
+                .copied()
+                .map(Value::integer)
+                .collect();
+            if !parameters.is_empty() {
+                let sql = format!(
+                    "SELECT id,category_id,embedding FROM catalog WHERE id IN ({})",
+                    vec!["?"; parameters.len()].join(",")
+                );
+                for row in self.db.query(&sql, parameters)? {
+                    let row = row?;
+                    add_anchor(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get_value(2).and_then(Value::as_vector_f32).as_deref(),
+                    );
                 }
             }
         }
@@ -302,6 +411,9 @@ impl Projection {
                 "SELECT id,category_id,popularity,trend_views,NULL FROM catalog WHERE price IS NOT NULL",
             )
         };
+        if explore && weights.is_empty() {
+            sql.push_str(" AND trend_views>0");
+        }
         for (value, clause) in [
             (filters.product_id, " AND id<>?"),
             (filters.category_id, " AND category_id=?"),
@@ -434,7 +546,13 @@ mod tests {
             .await?;
         let now = chrono::Utc::now().timestamp();
         let cold = cache
-            .rank("guest".into(), Filters::default(), Vec::new(), now)
+            .rank(
+                "guest".into(),
+                Filters::default(),
+                Vec::new(),
+                now,
+                Vec::new(),
+            )
             .await?;
         assert_eq!(cold, Some(vec![3, 2, 1]));
         let filters = Filters {
@@ -442,7 +560,7 @@ mod tests {
             ..Filters::default()
         };
         let similar = cache
-            .rank("detail".into(), filters, Vec::new(), now)
+            .rank("detail".into(), filters, Vec::new(), now, Vec::new())
             .await?;
         assert_eq!(similar, Some(vec![2, 3]));
         assert!(
@@ -456,7 +574,7 @@ mod tests {
         };
         assert_eq!(
             cache
-                .rank("filter".into(), filters, Vec::new(), now)
+                .rank("filter".into(), filters, Vec::new(), now, Vec::new())
                 .await?,
             Some(vec![1])
         );
@@ -509,7 +627,13 @@ mod tests {
             ..Filters::default()
         };
         let cold = cache
-            .rank("cold-explore".into(), filters.clone(), Vec::new(), now)
+            .rank(
+                "cold-explore".into(),
+                filters.clone(),
+                Vec::new(),
+                now,
+                Vec::new(),
+            )
             .await?;
         assert_eq!(cold, Some(vec![3, 2]));
         let view = vec![Signal {
@@ -518,9 +642,31 @@ mod tests {
             at: now,
         }];
         let ranked = cache
-            .rank("personal-explore".into(), filters, view, now)
+            .rank(
+                "personal-explore".into(),
+                filters.clone(),
+                view,
+                now,
+                Vec::new(),
+            )
             .await?;
         assert_eq!(ranked, Some(vec![1, 2, 3]));
+
+        let older_view = vec![Signal {
+            product_id: 99,
+            kind: SignalKind::View,
+            at: now - DAY,
+        }];
+        let ranked = cache
+            .rank(
+                "older-view".into(),
+                filters,
+                older_view,
+                now,
+                vec![product(99, 10, Some(15), 0, 0)],
+            )
+            .await?;
+        assert_eq!(ranked, Some(vec![2, 1, 3]));
         Ok(())
     }
 }
