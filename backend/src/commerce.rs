@@ -45,7 +45,11 @@ struct Line {
 #[derive(Deserialize)]
 struct Quantity {
     quantity: i32,
+    #[serde(default)]
+    imported: bool,
 }
+const SET_CART: &str = "INSERT INTO carts(user_id,variant_id,quantity) VALUES (?,?,?)
+    ON DUPLICATE KEY UPDATE quantity=VALUES(quantity)";
 async fn cart(State(app): State<App>, user: User) -> Result {
     Ok(Json(json!(decode_rows(sqlx::query_scalar("SELECT JSON_OBJECT('id',v.id,'product_id',p.id,'product_name',p.name,'image',p.image,'shop',s.name,'variant',v.name,'subvariant',v.subvariant,'price',v.price,'quantity',c.quantity,'created_at',c.created_at,'reason',CASE WHEN NOT v.enabled OR p.status<>'active' OR s.suspended THEN 'Unavailable' WHEN v.stock=0 THEN 'Out of stock' WHEN v.stock<c.quantity THEN 'Insufficient stock' ELSE NULL END) FROM carts c JOIN variants v ON v.id=c.variant_id JOIN products p ON p.id=v.product_id JOIN shops s ON s.id=p.shop_id WHERE c.user_id=? ORDER BY c.created_at DESC")
         .bind(user.id).fetch_all(&app.db).await?)?)))
@@ -89,9 +93,59 @@ async fn set_cart(
             .fetch_one(&app.db)
             .await?;
         validate(&line, input.quantity)?;
-        sqlx::query("INSERT INTO carts(user_id,variant_id,quantity) VALUES (?,?,?) ON DUPLICATE KEY UPDATE quantity=VALUES(quantity)").bind(user.id).bind(id).bind(input.quantity).execute(&app.db).await?;
+        if app.recommendations.enabled() && !user.is_guest() && !input.imported {
+            let mut retries = 2;
+            loop {
+                match set_cart_and_record(&app.db, user.id, &line, input.quantity).await {
+                    Ok(()) => break,
+                    Err(error)
+                        if retries > 0
+                            && error
+                                .as_database_error()
+                                .is_some_and(|error| error.code().as_deref() == Some("40001")) =>
+                    {
+                        // Concurrent first updates can both observe a missing cart row.
+                        retries -= 1;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        } else {
+            sqlx::query(SET_CART)
+                .bind(user.id)
+                .bind(id)
+                .bind(input.quantity)
+                .execute(&app.db)
+                .await?;
+        }
     }
     Ok(ok())
+}
+
+async fn set_cart_and_record(
+    db: &MySqlPool,
+    user: i64,
+    line: &Line,
+    quantity: i32,
+) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    let prior: Option<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM carts WHERE user_id=? AND variant_id=? FOR UPDATE",
+    )
+    .bind(user)
+    .bind(line.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(SET_CART)
+        .bind(user)
+        .bind(line.id)
+        .bind(quantity)
+        .execute(&mut *tx)
+        .await?;
+    if quantity > prior.unwrap_or(0) {
+        crate::recommendations::record_cart(&mut tx, user, line.product_id).await?;
+    }
+    tx.commit().await
 }
 async fn addresses(State(app): State<App>, user: User) -> Result {
     Ok(Json(json!(decode_rows(sqlx::query_scalar("SELECT JSON_OBJECT('id',id,'label',label,'detail',detail) FROM addresses WHERE user_id=? ORDER BY id DESC").bind(user.id).fetch_all(&app.db).await?)?)))

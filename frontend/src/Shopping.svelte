@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ArrowLeft, ArrowRight, CreditCard, MapPin, Package, ShoppingBag, Store, Truck } from '@lucide/svelte';
-  import { api, checkedGuestCart, date, downloadReturnMedia, guestCart, guestSession, key, label, message, money, params, save, setGuest, signedIn, type ItemPick, type Row } from './api';
+  import { api, checkedGuestCart, date, downloadReturnMedia, guestCart, guestSession, key, label, message, money, params, recommendedProducts, recordProductView, save, setGuest, signedIn, type ItemPick, type Row } from './api';
   import { CursorPager } from './cursor-pager.svelte';
   import CursorMore from './CursorMore.svelte';
   import ProductGrid from './ProductGrid.svelte';
@@ -12,6 +12,8 @@
   let id=$derived(Number(parts[1]));
   let authenticated=$state(signedIn());
   let data=$state<Row|null>(null), rows=$state<Row[]>([]), addresses=$state<Row[]>([]);
+  let recommendations = $state.raw<Row[]>([]);
+  let relatedProducts = $derived(recommendations.length ? recommendations : data?.similar ?? []);
   let error=$state(''), feedback=$state(''), loading=$state(true), pending=$state(false);
   let variantId=$state<number|undefined>(), quantity=$state(1), selected=$state<number[]>([]);
   let variant=$derived(data?.variants?.find((v:Row)=>v.id===variantId));
@@ -38,6 +40,10 @@
         const product=await api('/products/'+id);
         data=product;
         variantId=product.variants.find((v:Row)=>v.stock>0)?.id??product.variants[0]?.id;
+        recommendations = [];
+        void recordProductView(product.id).then(() => recommendedProducts(product.id)).then(items => {
+          if (data?.id === product.id) recommendations = items;
+        }).catch(() => {});
       } else if(page==='cart') {
         rows=signedIn()&&!guestSession()?await api<Row[]>('/cart'):await checkedGuestCart();
         selected=rows.filter(v=>!v.reason).map(v=>v.id);
@@ -167,7 +173,7 @@
     </div>
   </section>
   <section class="panel section"><h2>Customer reviews</h2>{#each data.reviews as review (review.id)}<article class="review"><div class="split"><strong>{review.user}</strong><span class="rating">{review.rating}/5</span></div><p>{review.body}</p>{@render media(review.media)}{#if review.reply}<blockquote><strong>Shop reply</strong><br>{review.reply}</blockquote>{/if}</article>{:else}<p class="muted">No reviews yet.</p>{/each}</section>
-  {#if data.similar.length}<section class="section"><h2>More to explore</h2><ProductGrid items={data.similar}/></section>{/if}
+  {#if relatedProducts.length}<section class="section"><h2>More to explore</h2><ProductGrid items={relatedProducts}/></section>{/if}
 {:else if page==='cart'}
   <h1>Shopping cart</h1>
   {#if rows.length}

@@ -1,7 +1,9 @@
 mod auth;
 mod catalog;
 mod commerce;
+mod embeddings;
 mod operations;
+mod recommendations;
 mod search;
 mod test_seed;
 mod uploads;
@@ -34,6 +36,7 @@ struct App {
     db: MySqlPool,
     secret: String,
     search: search::Search,
+    recommendations: recommendations::Recommendations,
     tax: i64,
 }
 
@@ -209,10 +212,15 @@ async fn main() -> anyhow::Result<()> {
     if secret.len() < 32 {
         anyhow::bail!("Set JWT_SECRET to at least 32 bytes in .env");
     }
+    let recommendations = recommendations::Recommendations::new();
+    let hybrid_search = setting("SEMANTIC_SEARCH_ENABLED", "false") == "true";
+    let embedder =
+        embeddings::Embedder::new(!seed_test && (hybrid_search || recommendations.enabled()));
     let app = App {
         db,
         secret,
-        search: search::Search::new()?,
+        search: search::Search::new(hybrid_search, embedder.clone())?,
+        recommendations,
         tax: setting("TAX_BASIS_POINTS", "0")
             .parse::<i64>()?
             .clamp(0, 10000),
@@ -228,6 +236,16 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(uploads::PUBLIC_DIR).await?;
     tokio::fs::create_dir_all(uploads::PRIVATE_DIR).await?;
     tokio::spawn(search::index_worker(app.clone()));
+    if app.recommendations.enabled() {
+        tokio::spawn(recommendations::refresh_worker(app.clone()));
+    }
+    if embedder.enabled() {
+        tokio::spawn(embeddings::worker(
+            app.db.clone(),
+            embedder,
+            app.recommendations.enabled(),
+        ));
+    }
     let compress_json = SizeAbove::default().and(|_, _, headers: &HeaderMap, _: &Extensions| {
         headers.get(CONTENT_TYPE).is_some_and(|content_type| {
             content_type
@@ -241,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
             auth::routes()
                 .merge(catalog::routes())
                 .merge(commerce::routes())
+                .merge(recommendations::routes())
                 .merge(operations::routes())
                 .fallback(|| async { Error::missing() })
                 .layer(CompressionLayer::new().compress_when(compress_json))

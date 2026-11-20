@@ -2,7 +2,7 @@ use super::IndexDefinition;
 use meilisearch_sdk::settings::Settings;
 
 pub(super) const INDEX: IndexDefinition = IndexDefinition {
-    uid_prefix: "tosca_market_shops_v3",
+    uid_prefix: "tosca_market_shops_v5",
     entity_type: "shop",
     settings,
     displayed: &["id", "name"],
@@ -10,7 +10,7 @@ pub(super) const INDEX: IndexDefinition = IndexDefinition {
         SELECT 'shop',id FROM shops WHERE TRUE
         ON DUPLICATE KEY UPDATE revision=revision+1,updated_at=CURRENT_TIMESTAMP(6)",
     select_jobs: "SELECT j.entity_id,j.revision,
-        CASE WHEN NOT s.suspended THEN JSON_OBJECT('id',s.id,'name',s.name) END AS document
+        CASE WHEN NOT s.suspended THEN JSON_OBJECT('id',s.id,'name',s.name) END AS document,NULL AS embedding
         FROM search_sync_jobs j LEFT JOIN shops s ON s.id=j.entity_id
         WHERE j.entity_type='shop' ORDER BY j.updated_at,j.entity_id LIMIT 256",
 };

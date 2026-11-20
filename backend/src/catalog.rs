@@ -52,29 +52,50 @@ pub fn page(mut items: Vec<Value>) -> Json<Value> {
     Json(json!({"items":items,"cursor":cursor}))
 }
 async fn products(State(app): State<App>, Query(f): Query<Filter>) -> Result {
-    let order = if f.sort.as_deref() == Some("oldest") {
-        "p.id>? ORDER BY p.id ASC"
+    let oldest = f.sort.as_deref() == Some("oldest");
+    let cursor = f.cursor.unwrap_or(if oldest { 0 } else { i64::MAX });
+    let mut query = sqlx::QueryBuilder::new(ITEMS);
+    if let Some(category) = f.category.as_deref().filter(|name| !name.is_empty()) {
+        query
+            .push(" AND p.category_id=(SELECT id FROM taxonomy WHERE kind='category' AND name=")
+            .push_bind(category)
+            .push(")");
+    }
+    if let Some(shop) = f.shop.filter(|id| *id != 0) {
+        query.push(" AND p.shop_id=").push_bind(shop);
+    }
+    let (cursor_sql, sort_sql) = if oldest {
+        (" AND p.id>", " ORDER BY p.id ASC LIMIT 21")
     } else {
-        "p.id<? ORDER BY p.id DESC"
+        (" AND p.id<", " ORDER BY p.id DESC LIMIT 21")
     };
-    let cursor = f.cursor.unwrap_or(if f.sort.as_deref() == Some("oldest") {
-        0
-    } else {
-        i64::MAX
-    });
-    let category = f.category.as_deref().unwrap_or("");
-    let shop = f.shop.unwrap_or(0);
-    let sql = format!("{ITEMS} AND (?='' OR c.name=?) AND (?=0 OR s.id=?) AND {order} LIMIT 21");
-    let values = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-        .bind(category)
-        .bind(category)
-        .bind(shop)
-        .bind(shop)
-        .bind(cursor)
-        .fetch_all(&app.db)
-        .await?;
+    query.push(cursor_sql).push_bind(cursor).push(sort_sql);
+    let values = query.build_query_scalar().fetch_all(&app.db).await?;
     Ok(page(decode_rows(values)?))
 }
+
+pub async fn explore_tail(
+    db: &MySqlPool,
+    before: Option<i64>,
+    excluded: &[i64],
+    limit: u32,
+) -> Result<Vec<Value>> {
+    let mut query = sqlx::QueryBuilder::new(ITEMS);
+    if let Some(before) = before {
+        query.push(" AND p.id<").push_bind(before);
+    }
+    if !excluded.is_empty() {
+        query.push(" AND p.id NOT IN (");
+        let mut ids = query.separated(",");
+        for id in excluded {
+            ids.push_bind(*id);
+        }
+        ids.push_unseparated(")");
+    }
+    query.push(" ORDER BY p.id DESC LIMIT ").push_bind(limit);
+    decode_rows(query.build_query_scalar().fetch_all(db).await?)
+}
+
 pub async fn variants(app: &App, id: i64, show_disabled: bool) -> Result<Vec<Value>> {
     decode_rows(sqlx::query_scalar("SELECT JSON_OBJECT('id',id,'name',name,'subvariant',subvariant,'price',price,'stock',stock,'grams',grams,'enabled',enabled) FROM variants WHERE product_id=? AND (? OR enabled) ORDER BY id")
         .bind(id).bind(show_disabled).fetch_all(&app.db).await?)

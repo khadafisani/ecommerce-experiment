@@ -10,3 +10,4 @@ scripts
 .agents
 skills-lock.json
 *.lock
+.codex

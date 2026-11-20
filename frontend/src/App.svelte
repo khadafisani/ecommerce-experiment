@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ArrowRight, Bell, ChevronDown, ChevronRight, Coffee, Headphones, House, LayoutGrid, Package, Shirt, ShoppingBag, Sparkles, Store, Truck, UserRound, Volleyball } from '@lucide/svelte';
-  import { api, clear, groupSearchHits, guestCart, guestSession, key, logout, mergeGuestCart, message, params, save, signedIn, type Row, type SearchGroups, type SearchResponse } from './api';
+  import { api, clear, exploreRecommendations, groupSearchHits, guestCart, guestSession, key, logout, mergeGuestCart, message, params, save, signedIn, type Row, type SearchGroups, type SearchResponse } from './api';
   import { CursorPager } from './cursor-pager.svelte';
   import CursorMore from './CursorMore.svelte';
   import ProductGrid from './ProductGrid.svelte';
@@ -15,13 +15,15 @@
   const authPage = ['login','register','forgot','reset'].includes(portal==='customer'?page:parts[1]) && !(portal==='admin'&&parts[1]==='register');
   const mode = portal==='customer'?page:parts[1];
   const browse = page === '' || page === 'search' || page === 'shop';
+  const category = search.get('category');
+  const storefrontHome = page === '' && !category;
   let account = $state<Row|null>(null), cartCount = $state(guestCart().reduce((sum,row)=>sum+row.quantity,0));
   let searchGroups = $state.raw<SearchGroups>({ products: [], shops: [] });
   let categories = $state<Row[]>([]);
-  const pager = new CursorPager<Row & {id:number}>();
-  let sort=$state('newest');
+  const pager = new CursorPager<Row & {id:number}, number | string>();
+  let sort = $state<'for-you' | 'newest' | 'oldest'>(storefrontHome ? 'for-you' : 'newest');
+  let hasForYou = $state(storefrontHome);
   let busy=$state(browse), error=$state(''), authNotice=$state('');
-  const category = search.get('category');
   const icons = [{name:'All products',icon:LayoutGrid},{name:'Fashion',icon:Shirt},{name:'Electronics',icon:Headphones},{name:'Home & Living',icon:House},{name:'Beauty',icon:Sparkles},{name:'Sports',icon:Volleyball},{name:'Food & Drink',icon:Coffee}];
   const publicLinks = $derived([...icons,...categories.filter(c=>c.kind==='category'&&!icons.some(i=>i.name===c.name)).map(c=>({name:String(c.name),icon:Package}))]);
   const prefix = portal==='customer'?'':'/'+portal;
@@ -32,8 +34,28 @@
   let shopTitle = $derived(page==='shop' ? pager.items[0]?.shop ?? 'Shop catalog' : '');
   let catalogError = $derived(page==='search' ? error : pager.cursor===null ? pager.error : '');
   const shopKey=key();
+  let catalogRevision = 0;
+
   async function load() {
+    const revision = ++catalogRevision;
     if(page!=='search') {
+      if (sort === 'for-you') {
+        const fetchPage = exploreRecommendations();
+        await pager.reset(async cursor => {
+          const result = await fetchPage(typeof cursor === 'string' ? cursor : null);
+          if (!result.enabled && revision === catalogRevision) {
+            hasForYou = false;
+            sort = 'newest';
+            void load();
+          }
+          return result;
+        });
+        if (revision === catalogRevision && pager.error) {
+          sort = 'newest';
+          await load();
+        }
+        return;
+      }
       const filters={category,sort,shop:page==='shop'?parts[1]:null};
       await pager.reset(cursor=>api('/products'+params({...filters,cursor})));
       return;
@@ -44,9 +66,24 @@
       searchGroups=groupSearchHits(result);
     }catch(e){error=message(e);}finally{busy=false;}
   }
+
+  function selectSort(event: Event & { currentTarget: HTMLSelectElement }) {
+    const selected = event.currentTarget.value;
+    if (selected === 'for-you' || selected === 'newest' || selected === 'oldest') {
+      sort = selected;
+      void load();
+    }
+  }
+
+  function restoreStorefront(event: PageTransitionEvent) {
+    if (!storefrontHome || !event.persisted) return;
+    void load();
+  }
+
   onMount(()=>{
     const continueCheckout=()=>{continuingCheckout=true;};
     window.addEventListener('tosca-checkout-auth',continueCheckout);
+    if (page === 'checkout') window.addEventListener('beforeunload', checkoutLeave);
     if(browse) {
       void load();
       api<Row[]>('/categories').then(value=>categories=value).catch(()=>{});
@@ -55,7 +92,10 @@
       api('/auth/me').then(value=>account=value).catch(()=>{});
       void updateCount();
     }
-    return ()=>window.removeEventListener('tosca-checkout-auth',continueCheckout);
+    return () => {
+      window.removeEventListener('tosca-checkout-auth', continueCheckout);
+      if (page === 'checkout') window.removeEventListener('beforeunload', checkoutLeave);
+    };
   });
   async function updateCount() {
     try { cartCount=(signedIn()&&!guestSession()?await api<Row[]>('/cart'):guestCart()).reduce((sum,row)=>sum+row.quantity,0); } catch {}
@@ -81,7 +121,7 @@
   <p class="error" role="alert">This page could not load. <button onclick={() => location.reload()}>Reload page</button></p>
 {/snippet}
 
-<svelte:window onbeforeunload={checkoutLeave}/>
+<svelte:window onpageshow={restoreStorefront}/>
 <header class="site-header">
   <div class="header-inner wrap">
     <a href="/" class="brand" aria-label="Tosca Market home"><span class="brand-mark"><ShoppingBag size={21} strokeWidth={2.3}/></span><span>tosca<span class="brand-dot">.</span><small>MARKET</small></span></a>
@@ -117,7 +157,7 @@
       {/if}
     </section>
   {:else if browse}
-    {#if page===''&&!category}
+    {#if storefrontHome}
       <section class="hero">
         <div class="hero-content"><div class="eyebrow"><span></span> THE EVERYDAY EDIT</div><h1>Good finds.<br><em>Better days.</em></h1><p>Discover something for every day, from independent shops and brands.</p><a class="hero-button" href="#catalog">Explore products <ArrowRight size={17}/></a></div>
         <div class="hero-image">
@@ -129,8 +169,16 @@
       <div class="service-strip"><span><Store size={18}/> Shop independent</span><span><Package size={18}/> Delivery from every shop</span><span><Truck size={18}/> Track your orders</span></div>
     {/if}
     <section id="catalog" class="catalog">
-      <div class="section-head"><div><h2>{page==='search'?'Search results':shopTitle||category||'Explore products'}</h2>{#if page==='search'}<p>Results for “{search.get('q') ?? ''}”</p>{:else if !category && !shopTitle}<p>Latest finds from across the marketplace.</p>{/if}</div>
-        {#if page!=='search'}<label class="sort">Sort by <select aria-label="Sort products" bind:value={sort} onchange={()=>load()}><option value="newest">Newest</option><option value="oldest">Oldest</option></select></label>{/if}
+      <div class="section-head"><div><h2>{page==='search'?'Search results':shopTitle||category||'Explore products'}</h2>{#if page==='search'}<p>Results for “{search.get('q') ?? ''}”</p>{:else if storefrontHome && sort === 'newest'}<p>Latest finds from across the marketplace.</p>{/if}</div>
+        {#if page !== 'search' && (!storefrontHome || hasForYou)}
+          <label class="sort">Sort by
+            <select aria-label="Sort products" value={sort} onchange={selectSort}>
+              {#if hasForYou}<option value="for-you">For you</option>{/if}
+              <option value="newest">Newest</option>
+              {#if !storefrontHome}<option value="oldest">Oldest</option>{/if}
+            </select>
+          </label>
+        {/if}
       </div>
       {#if catalogError}
         <p class="error" role="alert">{catalogError} <button onclick={()=>load()}>Retry</button></p>

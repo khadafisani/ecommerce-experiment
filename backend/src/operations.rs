@@ -85,22 +85,27 @@ fn period(value: Option<&str>) -> (&'static str, i32) {
     }
 }
 async fn series(app: &App, format: &str, days: i32, shop: i64, product: i64) -> Result<Vec<Value>> {
-    let sql = if product > 0 {
-        "SELECT JSON_OBJECT('label',DATE_FORMAT(o.completed_at,?), 'value',SUM(l.quantity)) FROM orders o JOIN order_lines l ON l.order_id=o.id WHERE o.shop_id=? AND l.product_id=? AND o.completed_at>=UTC_TIMESTAMP()-INTERVAL ? DAY GROUP BY DATE_FORMAT(o.completed_at,?) ORDER BY DATE_FORMAT(o.completed_at,?)"
+    let mut query =
+        sqlx::QueryBuilder::new("SELECT JSON_OBJECT('label',DATE_FORMAT(o.completed_at,");
+    query.push_bind(format);
+    if product > 0 {
+        query.push("), 'value',SUM(l.quantity)) FROM orders o JOIN order_lines l ON l.order_id=o.id WHERE l.product_id=")
+            .push_bind(product).push(" AND o.shop_id=").push_bind(shop).push(" AND ");
     } else {
-        "SELECT JSON_OBJECT('label',DATE_FORMAT(o.completed_at,?), 'value',SUM(o.subtotal)) FROM orders o WHERE (?=0 OR o.shop_id=?) AND o.completed_at>=UTC_TIMESTAMP()-INTERVAL ? DAY GROUP BY DATE_FORMAT(o.completed_at,?) ORDER BY DATE_FORMAT(o.completed_at,?)"
-    };
-    decode_rows(
-        sqlx::query_scalar(sql)
-            .bind(format)
-            .bind(shop)
-            .bind(if product > 0 { product } else { shop })
-            .bind(days)
-            .bind(format)
-            .bind(format)
-            .fetch_all(&app.db)
-            .await?,
-    )
+        query.push("), 'value',SUM(o.subtotal)) FROM orders o WHERE ");
+        if shop != 0 {
+            query.push("o.shop_id=").push_bind(shop).push(" AND ");
+        }
+    }
+    query
+        .push("o.completed_at>=UTC_TIMESTAMP()-INTERVAL ")
+        .push_bind(days)
+        .push(" DAY GROUP BY DATE_FORMAT(o.completed_at,")
+        .push_bind(format)
+        .push(") ORDER BY DATE_FORMAT(o.completed_at,")
+        .push_bind(format)
+        .push(")");
+    decode_rows(query.build_query_scalar().fetch_all(&app.db).await?)
 }
 async fn product(
     State(app): State<App>,

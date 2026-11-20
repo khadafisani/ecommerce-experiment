@@ -23,6 +23,8 @@ meilisearch-sdk = { version = "0.33", default-features = false, features = ["req
 lettre = { version = "0.11.24", features = ["tokio1-native-tls"] }
 hex = "0.4"
 img4avif = { version = "0.7", default-features = false }
+stoolap = { version = "=0.5.0", default-features = false, features = ["parallel"] }
+fastembed = { version = "=7.7.1", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "compression-zstd", "fs", "trace"] }

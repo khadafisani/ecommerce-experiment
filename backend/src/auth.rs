@@ -37,6 +37,18 @@ pub struct User {
     guest: bool,
 }
 impl User {
+    pub fn is_guest(&self) -> bool {
+        self.guest
+    }
+
+    pub async fn optional(headers: &HeaderMap, app: &App) -> Result<Option<Self>> {
+        if headers.contains_key(http::header::AUTHORIZATION) {
+            Self::authenticate(headers, app).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn admin(&self) -> Result<()> {
         if self.admin {
             Ok(())
@@ -44,12 +56,8 @@ impl User {
             Err(Error::forbidden())
         }
     }
-}
-impl FromRequestParts<App> for User {
-    type Rejection = Error;
-    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self> {
-        let token = parts
-            .headers
+    async fn authenticate(headers: &HeaderMap, app: &App) -> Result<Self> {
+        let token = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
@@ -57,6 +65,12 @@ impl FromRequestParts<App> for User {
         let claims = decode(app, token, "access")?;
         sqlx::query_as("SELECT u.id,u.name,u.email,u.admin,u.guest FROM users u JOIN sessions s ON s.user_id=u.id WHERE u.id=? AND s.id=? AND NOT s.revoked AND NOT u.suspended AND s.expires_at>UTC_TIMESTAMP()")
             .bind(claims.sub).bind(claims.sid).fetch_optional(&app.db).await?.ok_or_else(Error::unauthorized)
+    }
+}
+impl FromRequestParts<App> for User {
+    type Rejection = Error;
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self> {
+        Self::authenticate(&parts.headers, app).await
     }
 }
 #[derive(Serialize, Deserialize)]

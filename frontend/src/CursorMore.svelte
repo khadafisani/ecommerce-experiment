@@ -1,6 +1,6 @@
 <script lang="ts">
   let { cursor, loading, error, next }: {
-    cursor: number | null;
+    cursor: number | string | null;
     loading: boolean;
     error: string;
     next: () => void;

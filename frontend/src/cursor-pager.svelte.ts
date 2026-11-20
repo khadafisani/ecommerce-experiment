@@ -1,17 +1,17 @@
 import { message } from './api';
 
-type CursorPage<T> = { items: T[]; cursor: number | null };
-type FetchPage<T> = (cursor: number | null) => Promise<CursorPage<T>>;
+type CursorPage<T, C> = { items: T[]; cursor: C | null };
+type FetchPage<T, C> = (cursor: C | null) => Promise<CursorPage<T, C>>;
 
-export class CursorPager<T extends { id: number }> {
+export class CursorPager<T extends { id: number }, C extends number | string = number> {
   items = $state.raw<T[]>([]);
-  cursor = $state<number | null>(null);
+  cursor = $state<C | null>(null);
   loading = $state(false);
   error = $state('');
-  private fetchPage: FetchPage<T> | undefined;
+  private fetchPage: FetchPage<T, C> | undefined;
   private revision = 0;
 
-  reset(fetchPage: FetchPage<T>) {
+  reset(fetchPage: FetchPage<T, C>) {
     this.fetchPage = fetchPage;
     this.items = [];
     this.cursor = null;
@@ -23,7 +23,7 @@ export class CursorPager<T extends { id: number }> {
     return this.load(this.fetchPage, this.cursor, this.revision);
   }
 
-  private async load(fetchPage: FetchPage<T>, cursor: number | null, revision: number) {
+  private async load(fetchPage: FetchPage<T, C>, cursor: C | null, revision: number) {
     this.loading = true;
     this.error = '';
     try {

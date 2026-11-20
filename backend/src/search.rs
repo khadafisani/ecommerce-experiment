@@ -14,7 +14,7 @@ use meilisearch_sdk::{
 use serde::Deserialize;
 use sqlx::{Connection, MySqlConnection, QueryBuilder};
 
-use crate::{App, Error, Json, MySql, Result, StatusCode, Value, json, setting, text};
+use crate::{App, Error, Json, MySql, Result, StatusCode, Value, embeddings, json, setting, text};
 
 mod products;
 mod shops;
@@ -28,10 +28,12 @@ pub struct Search {
     client: Client,
     products: Index,
     shops: Index,
+    hybrid: bool,
+    embedder: embeddings::Embedder,
 }
 
 impl Search {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(hybrid: bool, embedder: embeddings::Embedder) -> anyhow::Result<Self> {
         let suffix = setting("MEILI_INDEX_SUFFIX", "");
         let client = Client::new(
             setting("MEILI_URL", "http://127.0.0.1:7700"),
@@ -43,6 +45,8 @@ impl Search {
             products: client.index(format!("{}{suffix}", products::INDEX.uid_prefix)),
             shops: client.index(format!("{}{suffix}", shops::INDEX.uid_prefix)),
             client,
+            hybrid,
+            embedder,
         })
     }
 
@@ -63,6 +67,8 @@ impl FromRef<App> for Search {
 #[derive(Deserialize)]
 pub struct SearchQuery {
     q: Option<String>,
+    #[serde(default)]
+    suggest: bool,
 }
 
 pub async fn query(State(search): State<Search>, Query(options): Query<SearchQuery>) -> Result {
@@ -76,13 +82,6 @@ async fn execute_query(search: &Search, options: &SearchQuery) -> Result {
     }
     let q = text(q, 150)?;
 
-    let products = search
-        .products
-        .search()
-        .with_query(q)
-        .with_limit(6)
-        .with_attributes_to_retrieve(Selectors::Some(products::INDEX.displayed))
-        .build();
     let shops = search
         .shops
         .search()
@@ -91,16 +90,56 @@ async fn execute_query(search: &Search, options: &SearchQuery) -> Result {
         .with_attributes_to_retrieve(Selectors::Some(shops::INDEX.displayed))
         .build();
 
-    let (products, shops) = tokio::time::timeout(Duration::from_secs(3), async {
-        tokio::try_join!(products.execute::<Value>(), shops.execute::<Value>())
+    let (items, shops) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::try_join!(
+            search.product_results(q, options.suggest),
+            shops.execute::<Value>()
+        )
     })
     .await
     .map_err(unavailable)?
     .map_err(unavailable)?;
 
     let shops: Vec<_> = shops.hits.into_iter().map(|hit| hit.result).collect();
-    let items: Vec<_> = products.hits.into_iter().map(|hit| hit.result).collect();
     Ok(Json(json!({"items":items, "shops":shops})))
+}
+
+impl Search {
+    async fn product_results(
+        &self,
+        query: &str,
+        suggest: bool,
+    ) -> std::result::Result<Vec<Value>, MeiliError> {
+        let mut request = self.products.search();
+        request
+            .with_query(query)
+            .with_limit(6)
+            .with_attributes_to_retrieve(Selectors::Some(products::INDEX.displayed));
+        if self.hybrid
+            && !suggest
+            && let Some(vector) = self.embedder.query(query).await
+        {
+            let mut hybrid = request.clone();
+            hybrid
+                .with_hybrid(embeddings::MODEL, 0.35)
+                .with_vector(&vector);
+            match tokio::time::timeout(Duration::from_millis(750), hybrid.execute::<Value>()).await
+            {
+                Ok(Ok(result)) => {
+                    return Ok(result.hits.into_iter().map(|hit| hit.result).collect());
+                }
+                Ok(Err(error)) => tracing::debug!(%error, "hybrid search fell back to lexical"),
+                Err(_) => tracing::debug!("hybrid search timed out; falling back to lexical"),
+            }
+        }
+        Ok(request
+            .execute::<Value>()
+            .await?
+            .hits
+            .into_iter()
+            .map(|hit| hit.result)
+            .collect())
+    }
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -125,6 +164,7 @@ struct Job {
     entity_id: i64,
     revision: u64,
     document: Option<String>,
+    embedding: Option<sqlx::types::Json<Vec<f32>>>,
 }
 
 async fn locked_connection(app: &App) -> anyhow::Result<Option<MySqlConnection>> {
@@ -179,6 +219,11 @@ async fn ensure_indexes(
         if created || verify_settings {
             let settings = (definition.settings)();
             if created || !settings_match(index, &settings).await? {
+                if !created && definition.entity_type == "product" {
+                    // The previous search worker could have drained the migration's backfill
+                    // during a rolling upgrade. Requeue with the new index settings.
+                    sqlx::query(definition.enqueue).execute(&mut *conn).await?;
+                }
                 wait_for_task(&search.client, index.set_settings(&settings).await?).await?;
             }
         }
@@ -195,12 +240,18 @@ async fn settings_match(index: &Index, settings: &Settings) -> anyhow::Result<bo
         Err(error) => return Err(error.into()),
     };
     let expected = serde_json::to_value(settings)?;
-    let fields = expected
-        .as_object()
-        .context("Invalid search index settings")?;
-    Ok(fields
-        .iter()
-        .all(|(key, value)| current.get(key) == Some(value)))
+    Ok(contains_settings(&current, &expected))
+}
+
+fn contains_settings(current: &Value, expected: &Value) -> bool {
+    match expected {
+        Value::Object(fields) => fields.iter().all(|(key, value)| {
+            current
+                .get(key)
+                .is_some_and(|current| contains_settings(current, value))
+        }),
+        _ => current == expected,
+    }
 }
 
 async fn publish_batch(
@@ -209,20 +260,36 @@ async fn publish_batch(
     index: &Index,
     definition: &IndexDefinition,
 ) -> anyhow::Result<()> {
-    let jobs: Vec<Job> = sqlx::query_as(definition.select_jobs)
-        .fetch_all(&mut *conn)
-        .await?;
+    let query = sqlx::query_as(definition.select_jobs);
+    let query = if definition.entity_type == "product" {
+        query.bind(embeddings::MODEL)
+    } else {
+        query
+    };
+    let jobs: Vec<Job> = query.fetch_all(&mut *conn).await?;
     if jobs.is_empty() {
         return Ok(());
     }
 
     let mut upserts = Vec::new();
     let mut removed = Vec::new();
+    let mut products = Vec::new();
     for job in &jobs {
         match &job.document {
-            Some(document) => upserts.push(serde_json::from_str::<Value>(document)?),
+            Some(document) => {
+                let mut document = serde_json::from_str::<Value>(document)?;
+                if definition.entity_type == "product" {
+                    products.push(job.entity_id);
+                    document["_vectors"] =
+                        json!({(embeddings::MODEL): job.embedding.as_ref().map(|v| &v.0)});
+                }
+                upserts.push(document);
+            }
             None => removed.push(job.entity_id),
         }
+    }
+    if !products.is_empty() {
+        embeddings::enqueue(&mut *conn, &products).await?;
     }
     if !removed.is_empty() {
         wait_for_task(&search.client, index.delete_documents(&removed).await?).await?;
@@ -295,8 +362,9 @@ async fn wait_for_startup_access(
         }
         // A worker serving the same database may already have prepared these indexes.
         if !pending(conn).await?
-            && settings_match(&search.products, &(products::INDEX.settings)()).await?
             && settings_match(&search.shops, &(shops::INDEX.settings)()).await?
+            && (settings_match(&search.products, &(products::INDEX.settings)()).await?
+                || settings_match(&search.products, &products::legacy_settings()).await?)
         {
             return Ok(false);
         }
