@@ -9,9 +9,13 @@ use axum::{
     routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
+use sqlx::mysql::MySqlDatabaseError;
+
+mod history;
 
 pub fn routes() -> Router<App> {
     Router::new()
+        .merge(history::routes())
         .route("/merchant/{shop}/dashboard", get(shop_dash))
         .route(
             "/merchant/{shop}/products",
@@ -33,7 +37,10 @@ pub fn routes() -> Router<App> {
         )
         .route("/merchant/{shop}/reviews/{id}", put(reply))
         .route("/merchant/{shop}/team", get(team).post(add_team))
-        .route("/merchant/{shop}/team/{employee}", put(update_employee))
+        .route(
+            "/merchant/{shop}/team/{employee}",
+            get(team_member).put(update_employee),
+        )
         .route("/admin/dashboard", get(admin_dash))
         .route("/admin/{section}", get(admin_list))
         .route("/admin/products/{id}", put(moderate_product))
@@ -582,14 +589,33 @@ const SHOP_OWNED_ACCOUNT: &str = "NOT u.admin AND NOT EXISTS(SELECT 1 FROM shops
 
 async fn team(State(app): State<App>, user: User, Path(shop): Path<i64>) -> Result {
     member(&app, &user, shop, true).await?;
+    Ok(Json(json!(team_records(&app, shop, None).await?)))
+}
+
+async fn team_member(
+    State(app): State<App>,
+    user: User,
+    Path((shop, employee)): Path<(i64, i64)>,
+) -> Result {
+    member(&app, &user, shop, true).await?;
+    team_records(&app, shop, Some(employee))
+        .await?
+        .pop()
+        .map(Json)
+        .ok_or_else(Error::missing)
+}
+
+async fn team_records(app: &App, shop: i64, employee: Option<i64>) -> Result<Vec<Value>> {
     let sql = format!(
-        "SELECT JSON_OBJECT('id',u.id,'name',u.name,'email',u.email,'role',IF(s.owner_id=u.id,'Owner','Employee'),'active',m.active,'suspended',u.suspended,'can_reset_password',IF({SHOP_OWNED_ACCOUNT},1,0)) FROM members m JOIN users u ON u.id=m.user_id JOIN shops s ON s.id=m.shop_id WHERE m.shop_id=? ORDER BY u.id"
+        "SELECT JSON_OBJECT('id',u.id,'name',u.name,'email',u.email,'role',IF(s.owner_id=u.id,'Owner','Employee'),'active',m.active,'suspended',u.suspended,'can_reset_password',IF({SHOP_OWNED_ACCOUNT},1,0)) FROM members m JOIN users u ON u.id=m.user_id JOIN shops s ON s.id=m.shop_id WHERE m.shop_id="
     );
-    let values = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-        .bind(shop)
-        .fetch_all(&app.db)
-        .await?;
-    Ok(Json(json!(decode_rows(values)?)))
+    let mut query = sqlx::QueryBuilder::<MySql>::new(sql);
+    query.push_bind(shop);
+    if let Some(employee) = employee {
+        query.push(" AND m.user_id=").push_bind(employee);
+    }
+    query.push(" ORDER BY u.id");
+    decode_rows(query.build_query_scalar().fetch_all(&app.db).await?)
 }
 
 #[derive(Deserialize)]
@@ -724,6 +750,176 @@ async fn shop_dash(
     ))
 }
 const TAXONOMY: &str = "SELECT JSON_OBJECT('id',id,'name',name,'kind',kind,'status',status,'created_at',created_at) FROM taxonomy";
+const ADMIN_PRODUCT_LIMIT: u32 = 100;
+const ADMIN_SHOP_LIMIT: u32 = 32;
+
+async fn admin_products(
+    app: &App,
+    search: Option<&str>,
+    status: &str,
+    sort: &'static str,
+) -> Result<Vec<String>> {
+    let search = search.map(str::trim).filter(|q| !q.is_empty());
+    let ids = match search {
+        Some(q)
+            if matches!(status, "" | "active")
+                && q.chars().any(char::is_alphanumeric)
+                && !q.contains(['%', '_', '\\']) =>
+        {
+            admin_product_candidates(app, q, status, sort).await?
+        }
+        _ => None,
+    };
+    let mut query = product_page_query(if ids.is_some() || status.is_empty() {
+        "PRIMARY"
+    } else {
+        "status"
+    });
+    match (ids, search) {
+        (Some(ids), _) => {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            query.push(" WHERE p.id IN (");
+            let mut values = query.separated(",");
+            for id in ids {
+                values.push_bind(id);
+            }
+            values.push_unseparated(")");
+        }
+        (None, Some(q)) => {
+            admin_product_substring_filter(&mut query, q);
+        }
+        (None, None) => {
+            query.push(" WHERE TRUE");
+        }
+    }
+    // Check the current status in MariaDB before returning moderation rows.
+    if !status.is_empty() {
+        query.push(" AND p.status=").push_bind(status);
+    }
+    product_page(&app.db, query, sort, ADMIN_PRODUCT_LIMIT).await
+}
+
+fn admin_product_substring_filter(query: &mut sqlx::QueryBuilder<MySql>, q: &str) {
+    query.push(" STRAIGHT_JOIN shops s FORCE INDEX (PRIMARY) ON s.id=p.shop_id WHERE CONCAT_WS(' ',p.name,s.name) LIKE ")
+        .push_bind(format!("%{q}%"));
+}
+
+async fn chronological_admin_product_ids(
+    db: &MySqlPool,
+    q: &str,
+    status: &str,
+    sort: &'static str,
+) -> Result<Option<Vec<i64>>> {
+    const ER_STATEMENT_TIMEOUT: u16 = 1969;
+
+    // Give broad matches a chance to fill a chronological page without scanning the whole catalog.
+    let mut query = sqlx::QueryBuilder::<MySql>::new(
+        "SET STATEMENT max_statement_time=0.12 FOR SELECT p.id FROM products p FORCE INDEX (",
+    );
+    query
+        .push(if status.is_empty() {
+            "PRIMARY"
+        } else {
+            "status"
+        })
+        .push(")");
+    admin_product_substring_filter(&mut query, q);
+    if !status.is_empty() {
+        query.push(" AND p.status=").push_bind(status);
+    }
+    query
+        .push(" ORDER BY p.id ")
+        .push(sort)
+        .push(" LIMIT ")
+        .push_bind(ADMIN_PRODUCT_LIMIT);
+    match query.build_query_scalar::<i64>().fetch_all(db).await {
+        Ok(ids) if ids.len() == ADMIN_PRODUCT_LIMIT as usize => Ok(Some(ids)),
+        Ok(_) => Ok(None),
+        Err(sqlx::Error::Database(error))
+            if error
+                .try_downcast_ref::<MySqlDatabaseError>()
+                .is_some_and(|error| error.number() == ER_STATEMENT_TIMEOUT) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn admin_product_candidates(
+    app: &App,
+    q: &str,
+    status: &str,
+    sort: &'static str,
+) -> Result<Option<Vec<i64>>> {
+    let Some(mut ids) = app
+        .search
+        .admin_product_ids(q, ADMIN_PRODUCT_LIMIT as usize)
+        .await
+    else {
+        return Ok(None);
+    };
+    if ids.len() > ADMIN_PRODUCT_LIMIT as usize {
+        if let Some(page) = chronological_admin_product_ids(&app.db, q, status, sort).await? {
+            return Ok(Some(page));
+        }
+        ids.truncate(ADMIN_PRODUCT_LIMIT as usize);
+    }
+    let pattern = format!("%{q}%");
+    let shops: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM shops WHERE suspended OR name LIKE ? LIMIT ?")
+            .bind(&pattern)
+            .bind(ADMIN_SHOP_LIMIT + 1)
+            .fetch_all(&app.db)
+            .await?;
+    if shops.len() > ADMIN_SHOP_LIMIT as usize {
+        return Ok(None);
+    }
+
+    // The storefront omits nonactive listings and products from suspended shops.
+    // Shop-name matches also need SQL because the storefront indexes product names separately.
+    if status.is_empty() {
+        let mut query = sqlx::QueryBuilder::<MySql>::new(
+            "SELECT id FROM products FORCE INDEX (status)
+             WHERE status IN ('pending','inactive','rejected') AND name LIKE ",
+        );
+        query
+            .push_bind(&pattern)
+            .push(" ORDER BY id ")
+            .push(sort)
+            .push(" LIMIT ")
+            .push_bind(ADMIN_PRODUCT_LIMIT);
+        ids.extend(query.build_query_scalar::<i64>().fetch_all(&app.db).await?);
+    }
+    if !shops.is_empty() {
+        let mut query = sqlx::QueryBuilder::<MySql>::new(
+            "SELECT p.id FROM products p FORCE INDEX (shop_id)
+             STRAIGHT_JOIN shops s ON s.id=p.shop_id WHERE p.shop_id IN (",
+        );
+        let mut shop_ids = query.separated(",");
+        for id in shops {
+            shop_ids.push_bind(id);
+        }
+        shop_ids.push_unseparated(")");
+        if !status.is_empty() {
+            query.push(" AND p.status='active'");
+        }
+        query
+            .push(" AND (p.name LIKE ")
+            .push_bind(&pattern)
+            .push(" OR s.name LIKE ")
+            .push_bind(&pattern)
+            .push(") ORDER BY p.id ")
+            .push(sort)
+            .push(" LIMIT ")
+            .push_bind(ADMIN_PRODUCT_LIMIT);
+        ids.extend(query.build_query_scalar::<i64>().fetch_all(&app.db).await?);
+    }
+    Ok(Some(ids))
+}
+
 async fn admin_dash(State(app): State<App>, user: User, Query(f): Query<Filter>) -> Result {
     user.admin()?;
     let (format, days) = period(f.status.as_deref());
@@ -774,24 +970,14 @@ async fn admin_list(
     };
     let values=match section.as_str() {
         "products" => {
-            let mut query = product_page_query(if status.is_empty() { "PRIMARY" } else { "status" });
-            if f.q.as_deref().is_some_and(|q| !q.is_empty()) {
-                query.push(" STRAIGHT_JOIN shops s FORCE INDEX (PRIMARY) ON s.id=p.shop_id WHERE CONCAT_WS(' ',p.name,s.name) LIKE ")
-                    .push_bind(&pattern);
-            } else {
-                query.push(" WHERE TRUE");
-            }
-            if !status.is_empty() {
-                query.push(" AND p.status=").push_bind(&status);
-            }
-            product_page(&app.db, query, sort, 100).await?
+            admin_products(&app, f.q.as_deref().filter(|q| !q.is_empty()), &status, sort).await?
         }
         "taxonomy"=>sqlx::query_scalar(sqlx::AssertSqlSafe(format!("{TAXONOMY} WHERE name LIKE ? AND (?='' OR status=?) ORDER BY id {sort} LIMIT 100"))).bind(&pattern).bind(&status).bind(&status).fetch_all(&app.db).await?,
         "users"=>sqlx::query_scalar("SELECT JSON_OBJECT('id',id,'name',name,'email',email,'admin',admin,'suspended',suspended) FROM users WHERE CONCAT_WS(' ',name,email) LIKE ? ORDER BY id DESC LIMIT 100").bind(&pattern).fetch_all(&app.db).await?,
         "shops"=>sqlx::query_scalar("SELECT JSON_OBJECT('id',s.id,'name',s.name,'owner',u.name,'suspended',s.suspended) FROM shops s JOIN users u ON u.id=s.owner_id WHERE s.name LIKE ? ORDER BY s.id DESC LIMIT 100").bind(&pattern).fetch_all(&app.db).await?,
         "couriers"=>sqlx::query_scalar("SELECT JSON_OBJECT('id',id,'name',name,'url',url,'logo',logo) FROM couriers WHERE name LIKE ? ORDER BY id").bind(&pattern).fetch_all(&app.db).await?,
         "payments"=>sqlx::query_scalar("SELECT JSON_OBJECT('id',c.id,'checkout_no',c.checkout_no,'name',u.name,'total',c.total,'payment',c.payment,'created_at',c.created_at) FROM checkouts c JOIN users u ON u.id=c.user_id WHERE CONCAT_WS(' ',c.checkout_no,u.name) LIKE ? AND (?='' OR c.payment=?) ORDER BY c.created_at DESC,c.id DESC LIMIT 100").bind(&pattern).bind(&status).bind(&status).fetch_all(&app.db).await?,
-        "reviews"=>sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT JSON_OBJECT('id',r.id,'name',p.name,'user',u.name,'shop',s.name,'body',r.body,'rating',r.rating,'created_at',r.created_at) FROM reviews r JOIN users u ON u.id=r.user_id JOIN products p ON p.id=r.product_id JOIN shops s ON s.id=p.shop_id WHERE NOT r.deleted AND CONCAT_WS(' ',r.body,p.name) LIKE ? AND (?=0 OR s.id=?) AND (?='' OR u.email=?) ORDER BY r.id {sort} LIMIT 100"))).bind(&pattern).bind(f.shop.unwrap_or(0)).bind(f.shop.unwrap_or(0)).bind(f.category.as_deref().unwrap_or("")).bind(f.category.as_deref().unwrap_or("")).fetch_all(&app.db).await?,
+        "reviews"=>sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT JSON_OBJECT('id',r.id,'name',p.name,'user',u.name,'shop',s.name,'body',r.body,'rating',r.rating,'created_at',r.created_at,'deleted',r.deleted) FROM reviews r JOIN users u ON u.id=r.user_id JOIN products p ON p.id=r.product_id JOIN shops s ON s.id=p.shop_id WHERE r.deleted=? AND CONCAT_WS(' ',r.body,p.name) LIKE ? AND (?=0 OR s.id=?) AND (?='' OR u.email=?) ORDER BY r.id {sort} LIMIT 100"))).bind(status=="hidden").bind(&pattern).bind(f.shop.unwrap_or(0)).bind(f.shop.unwrap_or(0)).bind(f.category.as_deref().unwrap_or("")).bind(f.category.as_deref().unwrap_or("")).fetch_all(&app.db).await?,
         _=>return Err(Error::missing()),
     };
     Ok(Json(json!(decode_rows(values)?)))

@@ -6,7 +6,7 @@ use meilisearch_sdk::{
     client::Client,
     errors::{Error as MeiliError, ErrorCode},
     indexes::Index,
-    search::Selectors,
+    search::{MatchingStrategies, Selectors},
     settings::Settings,
     task_info::TaskInfo,
     tasks::Task,
@@ -110,6 +110,45 @@ async fn execute_query(search: &Search, options: &SearchQuery) -> Result {
 }
 
 impl Search {
+    /// Returns storefront name matches with one extra hit to detect a full page.
+    pub(crate) async fn admin_product_ids(&self, query: &str, limit: usize) -> Option<Vec<i64>> {
+        const MIN_BROAD_MATCH_SCORE: f64 = 0.5;
+
+        #[derive(Deserialize)]
+        struct Hit {
+            id: i64,
+        }
+
+        let mut search = self.products.search();
+        search
+            .with_query(query)
+            .with_limit(limit + 1)
+            .with_matching_strategy(MatchingStrategies::ALL)
+            .with_attributes_to_search_on(&["name"])
+            .with_attributes_to_retrieve(Selectors::Some(&["id"]))
+            .with_show_ranking_score(true);
+
+        let results = tokio::time::timeout(Duration::from_millis(500), search.execute::<Hit>())
+            .await
+            .ok()?
+            .ok()?;
+        let broad = results.hits.len() > limit;
+        // Keep typo tolerance for small result sets. Discard weak matches when they fill the page.
+        Some(
+            results
+                .hits
+                .into_iter()
+                .filter(|hit| {
+                    !broad
+                        || hit
+                            .ranking_score
+                            .is_none_or(|score| score >= MIN_BROAD_MATCH_SCORE)
+                })
+                .map(|hit| hit.result.id)
+                .collect(),
+        )
+    }
+
     async fn product_results(
         &self,
         query: &str,
