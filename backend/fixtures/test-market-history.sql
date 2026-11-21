@@ -94,9 +94,9 @@ INSERT INTO history_totals
 SELECT n,seq,SUM(price*quantity),SUM(grams*quantity),FLOOR((SUM(price*quantity)*@seed_tax+5000)/10000)
 FROM history_lines GROUP BY n,seq;
 
-INSERT INTO checkouts(checkout_no,user_id,address,subtotal,tax,shipping,total,payment,paid_by,created_at,updated_at)
+INSERT INTO checkouts(checkout_no,user_id,address,subtotal,tax,shipping,total,payment,paid_by,created_at,updated_at,stock_reserved)
 SELECT c.number,c.buyer,c.address,t.subtotal,t.tax,t.shipping,t.subtotal+t.tax+t.shipping,c.payment,
-       IF(c.payment='paid',@fixture_admin,NULL),c.created,c.created
+       IF(c.payment='paid',@fixture_admin,NULL),c.created,c.created,FALSE
 FROM history_checkout c
 JOIN (SELECT n,SUM(subtotal) subtotal,SUM(shipping) shipping,SUM(tax) tax FROM history_totals GROUP BY n) t ON t.n=c.n
 ORDER BY c.created,c.n;

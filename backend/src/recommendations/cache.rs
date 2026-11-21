@@ -7,6 +7,7 @@ use std::{
 use anyhow::Context;
 use sqlx::{MySql, MySqlPool, QueryBuilder};
 use stoolap::{Database, Value};
+use tokio::sync::Semaphore;
 
 use super::{CANDIDATES, DAY, Filters, Signal, SignalKind, Sort, TTL};
 use crate::embeddings::{DIMENSIONS, MODEL};
@@ -16,8 +17,19 @@ const EXPLORE_TIER_SIZE: usize = CANDIDATES / 2;
 const CATEGORY_QUERY_BATCH: usize = 32;
 const PRODUCT_QUERY_BATCH: usize = 512;
 
-#[derive(Default)]
-pub(super) struct Cache(Mutex<Option<Projection>>);
+pub(super) struct Cache {
+    projection: Mutex<Option<Projection>>,
+    ranking: Arc<Semaphore>,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            projection: Mutex::default(),
+            ranking: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
 
 struct Projection {
     db: Database,
@@ -170,7 +182,7 @@ impl Cache {
             }
             let digest = digest.finalize().into();
             {
-                let mut current = cache.0.lock().map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
+                let mut current = cache.projection.lock().map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
                 if let Some(projection) = current.as_mut() {
                     if projection.refreshed > started {
                         return Ok(());
@@ -201,7 +213,7 @@ impl Cache {
             }
             projection.catalog_digest = digest;
             projection.refreshed = started;
-            let mut current = cache.0.lock().map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
+            let mut current = cache.projection.lock().map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
             if current.as_ref().is_some_and(|db| db.refreshed > started) {
                 return Ok(());
             }
@@ -219,7 +231,7 @@ impl Cache {
     pub(super) async fn lookup(self: &Arc<Self>, key: String) -> anyhow::Result<Lookup> {
         let cache = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            let Ok(current) = cache.0.try_lock() else {
+            let Ok(current) = cache.projection.try_lock() else {
                 return Ok(Lookup::Unavailable);
             };
             let Some(projection) = current.as_ref().filter(|p| p.refreshed.elapsed() < TTL) else {
@@ -241,10 +253,14 @@ impl Cache {
         now: i64,
         anchors: Vec<CatalogRow>,
     ) -> anyhow::Result<Option<Vec<i64>>> {
+        let Ok(permit) = Arc::clone(&self.ranking).try_acquire_owned() else {
+            return Ok(None);
+        };
         let cache = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let current = cache
-                .0
+                .projection
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recommendation cache lock poisoned"))?;
             let Some(projection) = current.as_ref().filter(|p| p.refreshed.elapsed() < TTL) else {
@@ -310,7 +326,7 @@ impl Projection {
     fn lookup(&self, key: &str) -> anyhow::Result<Option<Vec<i64>>> {
         let data: Option<String> = self.db.query_opt(
             "SELECT ids FROM ranked_products WHERE cache_key=$1 AND expires>$2",
-            (key, chrono::Utc::now().timestamp()),
+            (key, time::OffsetDateTime::now_utc().unix_timestamp()),
         )?;
         data.map(|data| serde_json::from_str(&data))
             .transpose()
@@ -320,7 +336,7 @@ impl Projection {
     fn prune(&self) -> anyhow::Result<()> {
         self.db.execute(
             "DELETE FROM ranked_products WHERE expires<=$1",
-            (chrono::Utc::now().timestamp(),),
+            (time::OffsetDateTime::now_utc().unix_timestamp(),),
         )?;
         Ok(())
     }
@@ -544,7 +560,7 @@ mod tests {
                 Instant::now(),
             )
             .await?;
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let cold = cache
             .rank(
                 "guest".into(),
@@ -600,7 +616,7 @@ mod tests {
     async fn explore_ranks_preferences_before_trends_and_leaves_general_items_for_the_tail()
     -> anyhow::Result<()> {
         let cache = Arc::new(Cache::default());
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         cache
             .refresh(
                 vec![

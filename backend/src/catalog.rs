@@ -1,11 +1,15 @@
 use super::*;
 use crate::{auth::User, uploads};
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    body::Bytes,
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     routing::{get, post},
 };
 use serde::Deserialize;
+use std::{net::SocketAddr, time::Duration};
+use tokio::sync::Semaphore;
 
+static UPLOADS: Semaphore = Semaphore::const_new(4);
 const CARD_SELECT: &str = "SELECT JSON_OBJECT('id',p.id,'name',p.name,'image',p.image,'shop_id',s.id,'shop',s.name,'category',c.name,'lowest_price',(SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled))";
 const VISIBLE_CATALOG: &str =
     " LEFT JOIN taxonomy c ON c.id=p.category_id WHERE p.status='active' AND NOT s.suspended";
@@ -17,7 +21,10 @@ pub fn routes() -> Router<App> {
         .route("/search", get(crate::search::query))
         .route("/categories", get(categories))
         .route("/couriers", get(couriers))
-        .route("/upload", post(upload))
+        .route(
+            "/upload",
+            post(upload).layer(DefaultBodyLimit::max(uploads::MAX_FILE_BYTES + 64 * 1024)),
+        )
 }
 async fn health(State(app): State<App>) -> Result {
     let version: String = sqlx::query_scalar("SELECT VERSION()")
@@ -197,30 +204,52 @@ struct UploadOptions {
     #[serde(default)]
     private: bool,
 }
-async fn upload(user: User, Query(options): Query<UploadOptions>, mut form: Multipart) -> Result {
-    let file = form
+async fn read_upload(mut form: Multipart) -> Result<(&'static str, Bytes)> {
+    let mut file = form
         .next_field()
         .await
         .map_err(|_| Error::bad("Invalid upload"))?
         .ok_or_else(|| Error::bad("Choose a file"))?;
-    let mime = file.content_type().unwrap_or("").to_owned();
-    let bytes = file
-        .bytes()
-        .await
-        .map_err(|_| Error::bad("Invalid upload"))?;
-    if bytes.len() > 20 * 1024 * 1024 {
-        return Err(Error::bad("The maximum file size is 20 MB"));
-    }
-    let extension = match mime.as_str() {
-        "video/mp4" if bytes.get(4..8) == Some(b"ftyp") => "mp4",
-        "video/webm" if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => "webm",
-        _ if mime.starts_with("image/") && bytes.len() <= uploads::MAX_IMAGE_BYTES => "avif",
-        _ => {
-            return Err(Error::bad(
-                "Choose an image up to 8 MB or an MP4/WebM video up to 20 MB",
-            ));
-        }
+    let invalid = || Error::bad("Choose an image or an MP4/WebM video up to 10 MB");
+    let extension = match file.content_type() {
+        Some("video/mp4") => "mp4",
+        Some("video/webm") => "webm",
+        Some(mime) if mime.starts_with("image/") => "avif",
+        _ => return Err(invalid()),
     };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = file
+        .chunk()
+        .await
+        .map_err(|_| Error::bad("Invalid upload"))?
+    {
+        if chunk.len() > uploads::MAX_FILE_BYTES - bytes.len() {
+            return Err(invalid());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty()
+        || (extension == "mp4" && bytes.get(4..8) != Some(b"ftyp"))
+        || (extension == "webm" && !bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]))
+    {
+        return Err(invalid());
+    }
+    Ok((extension, Bytes::from(bytes)))
+}
+
+async fn upload(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    user: User,
+    Query(options): Query<UploadOptions>,
+    form: Multipart,
+) -> Result {
+    let _permit = UPLOADS.try_acquire().map_err(|_| Error::busy())?;
+    crate::auth::rate_limit(&app.db, "upload-ip", peer.ip(), 30).await?;
+    crate::auth::rate_limit(&app.db, "upload-user", user.id, 10).await?;
+    let (extension, bytes) = tokio::time::timeout(Duration::from_secs(30), read_upload(form))
+        .await
+        .map_err(|_| Error(StatusCode::REQUEST_TIMEOUT, "Upload timed out".into()))??;
     let id = uuid::Uuid::new_v4();
     let (directory, url, stem) = if options.private {
         (

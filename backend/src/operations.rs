@@ -371,7 +371,7 @@ enum OrderStatus<'a> {
 async fn order_page(
     db: &MySqlPool,
     shop: i64,
-    before: Option<(chrono::NaiveDateTime, i64)>,
+    before: Option<(time::PlainDateTime, i64)>,
     status: OrderStatus<'_>,
     limit: u32,
 ) -> Result<Vec<Value>> {
@@ -479,10 +479,11 @@ async fn order(State(app): State<App>, user: User, Path((shop, id)): Path<(i64, 
     let mut values = decode_rows(vec![raw])?;
     let mut data = commerce::populate(&app, values.pop().ok_or_else(Error::missing)?).await?;
     data["address"] = json!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT c.address FROM checkouts c JOIN orders o ON o.checkout_id=c.id WHERE o.id=?"
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT IF(c.payment='paid',c.address,NULL) FROM checkouts c JOIN orders o ON o.checkout_id=c.id WHERE o.id=? AND o.shop_id=?"
         )
         .bind(id)
+        .bind(shop)
         .fetch_one(&app.db)
         .await?
     );
@@ -673,14 +674,14 @@ async fn create_account(app: &App, input: Account, shop: Option<i64>) -> Result 
     let password = auth::hash(input.password).await?;
     let mut tx = app.db.begin().await?;
     let id = inserted(
-        sqlx::query("INSERT INTO users(name,email,password,admin) VALUES (?,?,?,?)")
+        sqlx::query("INSERT INTO users(name,email,password,admin) VALUES (?,?,'!',?)")
             .bind(text(&input.name, 120)?)
             .bind(auth::email(&input.email)?)
-            .bind(password)
             .bind(shop.is_none())
             .execute(&mut *tx)
             .await?,
     )?;
+    auth::save_password(&mut tx, id, &password).await?;
     if let Some(shop) = shop {
         sqlx::query("INSERT INTO members(shop_id,user_id) VALUES (?,?)")
             .bind(shop)
@@ -1152,6 +1153,12 @@ async fn update_user(
         None => None,
     };
     let mut tx = app.db.begin().await?;
+    sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM users WHERE id=? AND email<>'checkout-expiry@system.tosca.invalid' FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
     if let Some(suspended) = input.suspended {
         sqlx::query("UPDATE users SET suspended=? WHERE id=?")
             .bind(suspended)

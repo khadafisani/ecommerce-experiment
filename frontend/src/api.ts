@@ -1,3 +1,5 @@
+import { prepareUpload } from './upload-media';
+
 export type Row = Record<string, any>;
 export type SearchHit = {
   id:number;
@@ -36,43 +38,184 @@ export const params = (values: Record<string, string | number | undefined | null
   for (const [name, value] of Object.entries(values)) if (value != null && value !== '') search.set(name, String(value));
   return search.size ? '?' + search : '';
 };
-let storage: Storage = sessionStorage.getItem('access') ? sessionStorage : localStorage.getItem('refresh') ? localStorage : sessionStorage;
-export const guestSession = () => storage === localStorage && Boolean(storage.getItem('access'));
-export const signedIn = () => Boolean(storage.getItem('access'));
-export function save(tokens: Row, guest = guestSession()) {
-  storage = guest ? localStorage : sessionStorage;
-  storage.setItem('access', tokens.access);
-  storage.setItem('refresh', tokens.refresh);
-  if (!guest) { localStorage.removeItem('access'); localStorage.removeItem('refresh'); }
-}
-export function clear() { storage.removeItem('access'); storage.removeItem('refresh'); }
-let refreshing: Promise<boolean> | undefined;
-async function renew() {
-  const refresh = storage.getItem('refresh');
-  if (!refresh) return false;
-  refreshing ??= fetch('/api/auth/refresh', {method:'POST', headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh})})
-    .then(async response => {
-      if (response.ok) {save(await response.json(),storage === localStorage); return true;}
-      if (response.status === 401) clear();
-      return false;
-    }).finally(() => { refreshing = undefined; });
-  return refreshing;
-}
-async function request(path: string, method = 'GET', body?: unknown, retry = true, keepalive = false, signal?: AbortSignal): Promise<Response> {
-  const headers = new Headers();
-  const token = storage.getItem('access');
-  if (token && !path.startsWith('/auth/login') && !path.startsWith('/auth/register')) headers.set('Authorization', 'Bearer ' + token);
-  if (body !== undefined && !(body instanceof FormData)) headers.set('Content-Type', 'application/json');
-  const response = await fetch('/api' + path, {method, headers, keepalive, signal, body: body instanceof FormData ? body : body === undefined ? undefined : JSON.stringify(body)});
-  if (response.status === 401 && retry && !path.startsWith('/auth/login') && await renew()) return request(path, method, body, false, keepalive, signal);
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error ?? 'Could not connect to Tosca Market');
+export function localRedirect(value: string | null, fallback: string) {
+  if (!value?.startsWith('/') || value.startsWith('//')) return fallback;
+  try {
+    const target = new URL(value, location.origin);
+    return target.origin === location.origin && !target.username && !target.password ? target.href : fallback;
+  } catch {
+    return fallback;
   }
-  return response;
+}
+
+export function trackingUrl(value: unknown) {
+  if (typeof value !== 'string') return undefined;
+  try {
+    const url = new URL(value);
+    if ((url.protocol === 'https:' || url.protocol === 'http:') && !url.username && !url.password) return url.href;
+  } catch { /* Skip invalid tracking URLs. */ }
+}
+
+const uuidPattern = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
+const publicMedia = new RegExp('^/uploads/' + uuidPattern + '\\.(avif|mp4|webm)$');
+const returnMedia = new RegExp('^/api/return-media/[1-9][0-9]*-' + uuidPattern + '\\.(avif|mp4|webm)$');
+export const isPublicMedia = (value: unknown): value is string => typeof value === 'string' && publicMedia.test(value);
+
+function currentSession() {
+  const marker = document.cookie.split(';').map(cookie => cookie.trim())
+    .find(cookie => cookie.startsWith('tosca_session='))?.slice('tosca_session='.length);
+  const match = /^(guest|account)\.([a-z0-9_-]+)\.([a-z0-9_-]+)$/i.exec(marker ?? '');
+  return match ? { kind: match[1], id: match[2], generation: match[3] } : undefined;
+}
+export const guestSession = () => currentSession()?.kind === 'guest';
+export const signedIn = () => Boolean(currentSession());
+
+const sessionChannel = 'tosca-session-identity';
+const identityObservers = new Set<(id: string | undefined) => void>();
+let localSessionChange = false;
+
+function openSessionChannel() {
+  try {
+    return typeof BroadcastChannel === 'undefined' ? undefined : new BroadcastChannel(sessionChannel);
+  } catch {
+    return undefined;
+  }
+}
+
+export function watchSessionIdentity(onChange: () => void) {
+  let observed = currentSession()?.id;
+  const update = (id: string | undefined) => { observed = id; };
+  const check = () => {
+    const id = currentSession()?.id;
+    if (localSessionChange || observed === id) return;
+    observed = id;
+    onChange();
+  };
+  identityObservers.add(update);
+  const channel = openSessionChannel();
+  channel?.addEventListener('message', check);
+  window.addEventListener('focus', check);
+  window.addEventListener('pageshow', check);
+  document.addEventListener('visibilitychange', check);
+  return () => {
+    identityObservers.delete(update);
+    channel?.close();
+    window.removeEventListener('focus', check);
+    window.removeEventListener('pageshow', check);
+    document.removeEventListener('visibilitychange', check);
+  };
+}
+
+async function changeSession<T>(operation: () => Promise<T>) {
+  const previous = currentSession()?.id;
+  localSessionChange = true;
+  try {
+    return await operation();
+  } finally {
+    localSessionChange = false;
+    const current = currentSession()?.id;
+    if (previous !== current) {
+      for (const notify of identityObservers) notify(current);
+      const channel = openSessionChannel();
+      channel?.postMessage('change');
+      channel?.close();
+    }
+  }
+}
+
+let authQueue = Promise.resolve();
+function withSessionLock<T>(operation: () => Promise<T>, signal: AbortSignal) {
+  if (navigator.locks) return navigator.locks.request('tosca-session', { signal }, operation);
+  const task = authQueue.then(() => {
+    signal.throwIfAborted();
+    return operation();
+  });
+  authQueue = task.then(() => {}, () => {});
+  return task;
+}
+
+function send(path: string, method: string, body: unknown, signal: AbortSignal, keepalive = false) {
+  const headers = new Headers();
+  if (method !== 'GET' && method !== 'HEAD') headers.set('X-Tosca-Request', '1');
+  if (body !== undefined && !(body instanceof FormData)) headers.set('Content-Type', 'application/json');
+  const payload = body === undefined || body instanceof FormData ? body : JSON.stringify(body);
+  return fetch('/api' + path, { method, headers, keepalive, signal, credentials: 'same-origin', body: payload });
+}
+
+async function checkResponse(response: Response) {
+  if (response.ok) return response;
+  const data = await response.json().catch(() => ({}));
+  throw new Error(data.error ?? 'Could not connect to Tosca Market');
+}
+
+async function request(path: string, method = 'GET', body?: unknown, retry = true, keepalive = false, signal?: AbortSignal): Promise<Response> {
+  method = method.toUpperCase();
+  const session = currentSession();
+  const timeout = AbortSignal.timeout(method === 'GET' || method === 'HEAD' ? 30_000 : 120_000);
+  const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const response = await send(path, method, body, requestSignal, keepalive);
+  if (response.status === 401 && retry && session && !requestSignal.aborted) {
+    const followup = await withSessionLock(async () => {
+      const current = currentSession();
+      if (current?.id !== session.id) return response;
+      if (current.generation === session.generation) {
+        const renewed = await changeSession(() => send('/auth/refresh', 'POST', undefined, AbortSignal.timeout(30_000)));
+        void renewed.body?.cancel().catch(() => {});
+        if (!renewed.ok || currentSession()?.id !== session.id) return response;
+      }
+      requestSignal.throwIfAborted();
+      void response.body?.cancel().catch(() => {});
+      return send(path, method, body, requestSignal, keepalive);
+    }, requestSignal);
+    return checkResponse(followup);
+  }
+  return checkResponse(response);
 }
 export async function api<T = Row>(path: string, method = 'GET', body?: unknown, retry = true, signal?: AbortSignal): Promise<T> {
   return (await request(path, method, body, retry, false, signal)).json() as Promise<T>;
+}
+
+export async function authenticate(mode: 'login' | 'register' | 'guest', body?: Row, { importGuestCart = false } = {}) {
+  const signal = AbortSignal.timeout(120_000);
+  await withSessionLock(async () => {
+    const prior = currentSession();
+    if (mode === 'guest' && prior) return;
+    await changeSession(() => api('/auth/' + mode, 'POST', body, false, signal));
+    const session = currentSession();
+    if (!session || session.id === prior?.id || session.kind !== (mode === 'guest' ? 'guest' : 'account')) {
+      throw new Error('Allow first-party cookies to sign in to Tosca Market.');
+    }
+    if (importGuestCart) await mergeGuestCart(signal).catch(() => {});
+  }, signal);
+}
+
+function discardLegacyCredentials() {
+  for (const readStorage of [() => localStorage, () => sessionStorage]) {
+    try {
+      const storage = readStorage();
+      for (const name of ['access', 'refresh', 'tosca-session']) storage.removeItem(name);
+    } catch { /* Storage can be unavailable even when cookies work. */ }
+  }
+}
+
+export async function initializeSession() {
+  try {
+    if (!signedIn() && localStorage.getItem('refresh')) {
+      const signal = AbortSignal.timeout(10_000);
+      await withSessionLock(async () => {
+        try {
+          const refresh = localStorage.getItem('refresh');
+          if (refresh && !signedIn()) {
+            await changeSession(() => api('/auth/session-upgrade', 'POST', { refresh }, false, signal));
+          }
+        } finally {
+          discardLegacyCredentials();
+        }
+      }, signal);
+      return;
+    }
+  } catch { /* Continue as signed out if the old guest session cannot be upgraded. */ }
+  discardLegacyCredentials();
 }
 
 type GuestSignal = { product_id: number; kind: 'view' | 'cart'; at: number };
@@ -117,8 +260,8 @@ function claimGuestView(productId: number) {
   const day = Math.floor(nowInSeconds() / secondsPerDay);
   try {
     const previous = JSON.parse(localStorage.getItem(guestViewsKey) ?? 'null');
-    const products: number[] = previous?.day === day && Array.isArray(previous.products) ? previous.products : [];
-    if (products.includes(productId)) return false;
+    const products: number[] = previous?.day === day && Array.isArray(previous.products) ? previous.products.slice(0, guestSignalLimit) : [];
+    if (products.length >= guestSignalLimit || products.includes(productId)) return false;
     localStorage.setItem(guestViewsKey, JSON.stringify({ day, products: [...products, productId] }));
     return true;
   } catch {
@@ -139,43 +282,61 @@ function currentGuestSignals() {
   return signedIn() && !guestSession() ? undefined : guestSignals(nowInSeconds());
 }
 
-export async function recommendedProducts(productId?: number): Promise<Row[]> {
+export async function recommendedProducts(productId?: number, signal?: AbortSignal): Promise<Row[]> {
   const { enabled, items } = await api<{ enabled: boolean; items: Row[] }>('/recommendations', 'POST', {
     product_id: productId,
     signals: currentGuestSignals(),
-  });
+  }, true, signal);
   return enabled ? items : [];
 }
 
 export function exploreRecommendations() {
   const signals = currentGuestSignals();
-  return (cursor: string | null) => api<{ enabled: boolean; items: (Row & { id: number })[]; cursor: string | null }>(
-    '/recommendations/explore', 'POST', cursor === null ? { signals } : { cursor },
+  return (cursor: string | null, signal: AbortSignal) => api<{ enabled: boolean; items: (Row & { id: number })[]; cursor: string | null }>(
+    '/recommendations/explore', 'POST', cursor === null ? { signals } : { cursor }, true, signal,
   );
 }
 
 export async function logout() {
-  const refresh = storage.getItem('refresh');
-  if (refresh) await api('/auth/logout','POST',{refresh},false);
-  clear();
+  const session = currentSession()?.id;
+  const signal = AbortSignal.timeout(30_000);
+  await withSessionLock(async () => {
+    if (currentSession()?.id === session) {
+      await changeSession(() => api('/auth/logout', 'POST', undefined, false, signal));
+    }
+  }, signal);
 }
-export async function upload(file: File, privateMedia = false) {
-  const form = new FormData(); form.append('file',file);
-  return (await api('/upload'+(privateMedia?'?private=true':''),'POST',form)).url as string;
+export async function upload(file: File, privateMedia = false, signal?: AbortSignal) {
+  const prepared = await prepareUpload(file, signal);
+  const form = new FormData();
+  form.append('file', prepared);
+  return (await api('/upload'+(privateMedia?'?private=true':''),'POST',form,true,signal)).url as string;
 }
 export async function downloadReturnMedia(url: string) {
-  if (!url.startsWith('/api/return-media/')) throw new Error('Attachment unavailable');
+  const extension = returnMedia.exec(url)?.[1];
+  if (!extension) throw new Error('Attachment unavailable');
   const response = await request(url.slice(4));
   const address = URL.createObjectURL(await response.blob());
   const link = document.createElement('a');
   link.href = address;
-  link.download = 'return-evidence.' + url.slice(url.lastIndexOf('.')+1);
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(address), 1000);
+  link.download = 'return-evidence.' + extension;
+  try { link.click(); }
+  finally { setTimeout(() => URL.revokeObjectURL(address), 1000); }
 }
 type GuestItem = Row & { id:number; quantity:number; created_at:string };
-export function guestCart(): GuestItem[] { try { return JSON.parse(localStorage.getItem('tosca-cart') ?? '[]'); } catch { return []; } }
+const cartLimit = 100;
+export function guestCart(): GuestItem[] {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem('tosca-cart') ?? '[]');
+    if (!Array.isArray(stored)) return [];
+    const valid = stored.filter((item): item is GuestItem => item != null && Number.isSafeInteger(item.id)
+      && item.id > 0 && Number.isInteger(item.quantity) && item.quantity > 0 && item.quantity <= 999
+      && typeof item.created_at === 'string');
+    return [...new Map(valid.map(row => [row.id, row])).values()];
+  } catch { return []; }
+}
 export function setGuest(id: number, quantity: number, item?: Row) {
+  if (!Number.isInteger(quantity) || quantity < 0 || quantity > 999) throw new Error('Enter a quantity from 1 to 999');
   const cart = guestCart();
   const old = cart.find(row => row.id === id);
   if (quantity && (item || old)) cart.push({ ...old, ...item, id, quantity, created_at: old?.created_at ?? new Date().toISOString() });
@@ -184,22 +345,27 @@ export function setGuest(id: number, quantity: number, item?: Row) {
     recordGuestSignal(item?.product_id ?? old?.product_id, 'cart');
   }
 }
-export async function checkedGuestCart() {
+export async function checkedGuestCart(signal?: AbortSignal) {
   const rows = guestCart();
-  if (!rows.length) return rows;
-  const updates = await api<Row[]>('/cart/availability','POST',rows.map(({id,quantity})=>({id,quantity})));
+  const updates = new Map<number, Row>();
+  for (let start = 0; start < rows.length; start += cartLimit) {
+    const batch = rows.slice(start, start + cartLimit).map(({ id, quantity }) => ({ id, quantity }));
+    const result = await api<Row[]>('/cart/availability', 'POST', batch, true, signal);
+    for (const item of result) updates.set(item.id, item);
+  }
   return rows.map(row => {
-    const update=updates.find(item => item.id === row.id);
-    return {...row,reason:update?.reason ?? null,price:update?.price ?? row.price};
+    const update = updates.get(row.id);
+    return { ...row, reason: update ? update.reason : 'Unavailable', price: update?.price ?? row.price };
   });
 }
-export async function mergeGuestCart() {
+async function mergeGuestCart(signal: AbortSignal) {
   const guest = guestCart();
   if (!guest.length) return;
-  const current = await api<Row[]>('/cart');
+  const current = await api<Row[]>('/cart', 'GET', undefined, false, signal);
   for (const item of guest) {
+    signal.throwIfAborted();
     const quantity = Math.max(item.quantity, current.find(row => row.id === item.id)?.quantity ?? 0);
-    try { await api('/cart/'+item.id,'PUT',{quantity,imported:true}); setGuest(item.id,0); } catch { /* Keep unavailable items in the guest cart. */ }
+    try { await api('/cart/'+item.id,'PUT',{quantity,imported:true},false,signal); setGuest(item.id,0); } catch { /* Keep unavailable items in the guest cart. */ }
   }
 }
 export const message = (e: unknown) => e instanceof Error ? e.message : String(e);

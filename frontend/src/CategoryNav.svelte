@@ -20,6 +20,7 @@
   let search = $state('');
   let picker: HTMLDetailsElement;
   let trigger: HTMLElement;
+  let pending: AbortController | undefined;
 
   const shortcuts = $derived(shortcutGroups.flatMap(({ names: choices, icon }) => {
     const name = choices.find(choice => names.includes(choice));
@@ -39,15 +40,21 @@
   });
 
   async function loadCategories() {
+    pending?.abort();
+    const controller = new AbortController();
+    pending = controller;
     loading = true;
     failed = false;
     try {
-      const entries = await api<{ name: string; kind: string }[]>('/categories');
-      names = entries.filter(entry => entry.kind === 'category').map(entry => entry.name);
+      const entries = await api<{ name: string; kind: string }[]>('/categories', 'GET', undefined, true, controller.signal);
+      if (!controller.signal.aborted) names = [...new Set(entries.filter(entry => entry.kind === 'category').map(entry => entry.name))];
     } catch {
-      failed = true;
+      if (!controller.signal.aborted) failed = true;
     } finally {
-      loading = false;
+      if (pending === controller) {
+        pending = undefined;
+        loading = false;
+      }
     }
   }
 
@@ -67,7 +74,10 @@
     }
   }
 
-  onMount(() => { void loadCategories(); });
+  onMount(() => {
+    void loadCategories();
+    return () => pending?.abort();
+  });
 </script>
 
 <svelte:window onpointerdown={dismissOutside} onkeydown={dismissOnEscape} />

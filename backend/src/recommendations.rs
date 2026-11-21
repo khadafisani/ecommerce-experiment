@@ -2,18 +2,18 @@
 mod benchmark;
 mod cache;
 
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::header::CACHE_CONTROL,
     response::{IntoResponse, Response},
     routing::post,
 };
-use chrono::Utc;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::QueryBuilder;
+use time::OffsetDateTime;
 
 use crate::{
     App, Error, HeaderMap, Json, MySql, Result, Router, Transaction, Value, auth::User, json, ok,
@@ -103,7 +103,12 @@ struct View {
     product_id: i64,
 }
 
-async fn view(State(app): State<App>, headers: HeaderMap, Json(input): Json<View>) -> Result {
+async fn view(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(input): Json<View>,
+) -> Result {
     if !app.recommendations.enabled() {
         return Ok(ok());
     }
@@ -125,6 +130,7 @@ async fn view(State(app): State<App>, headers: HeaderMap, Json(input): Json<View
         .execute(&app.db)
         .await?;
     } else {
+        crate::auth::rate_limit(&app.db, "guest-view", peer.ip(), 60).await?;
         sqlx::query(
             "INSERT INTO recommendation_guest_views(view_hour,product_id)
              SELECT DATE_FORMAT(UTC_TIMESTAMP(),'%Y-%m-%d %H:00:00'),p.id
@@ -216,7 +222,7 @@ async fn candidate_ids(
     let Some(cache) = &app.recommendations.cache else {
         return Vec::new();
     };
-    let now = Utc::now().timestamp();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
     if user.is_some_and(|user| !user.is_guest()) {
         signals.clear();
     } else {
@@ -306,7 +312,7 @@ async fn explore(
         ExploreCursor {
             kind: "explore".into(),
             viewer,
-            exp: Utc::now().timestamp() + DAY,
+            exp: OffsetDateTime::now_utc().unix_timestamp() + DAY,
             pending: candidate_ids(&app, user.as_ref(), filters.clone(), input.signals).await,
             shown: Vec::new(),
             before: None,

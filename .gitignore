@@ -10,6 +10,8 @@ scripts
 .agents
 skills-lock.json
 *.lock
+!/backend/Cargo.lock
+!/frontend/bun.lock
 .codex
 amazon_categories.csv
 amazon_products.csv

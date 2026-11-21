@@ -43,6 +43,7 @@
     return ()=>{
       clearTimeout(searchTimer);
       loadController?.abort();
+      pager.cancel();
     };
   });
   function queueSearch(event: Event & { currentTarget: HTMLInputElement }) {
@@ -62,7 +63,7 @@
       const route=base+'/'+section;
       const filters={q,status};
       loading=false;error='';
-      await pager.reset(cursor=>get(route+params({...filters,cursor})));
+      await pager.reset((cursor, signal)=>api(route+params({...filters,cursor}), 'GET', undefined, true, signal));
       return;
     }
     loading=true;error='';

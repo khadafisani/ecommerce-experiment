@@ -1,7 +1,7 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::Context;
-use axum::extract::{FromRef, Query, State};
+use axum::extract::{Query, State};
 use meilisearch_sdk::{
     client::Client,
     errors::{Error as MeiliError, ErrorCode},
@@ -12,7 +12,7 @@ use meilisearch_sdk::{
     tasks::Task,
 };
 use serde::Deserialize;
-use sqlx::{Connection, MySqlConnection, QueryBuilder};
+use sqlx::{Connection, MySqlConnection, MySqlPool, QueryBuilder};
 
 use crate::{App, Error, Json, MySql, Result, StatusCode, Value, embeddings, json, setting, text};
 
@@ -63,12 +63,6 @@ impl Search {
     }
 }
 
-impl FromRef<App> for Search {
-    fn from_ref(app: &App) -> Self {
-        app.search.clone()
-    }
-}
-
 #[derive(Deserialize)]
 pub struct SearchQuery {
     q: Option<String>,
@@ -76,11 +70,8 @@ pub struct SearchQuery {
     suggest: bool,
 }
 
-pub async fn query(State(search): State<Search>, Query(options): Query<SearchQuery>) -> Result {
-    execute_query(&search, &options).await
-}
-
-async fn execute_query(search: &Search, options: &SearchQuery) -> Result {
+pub async fn query(State(app): State<App>, Query(options): Query<SearchQuery>) -> Result {
+    let search = &app.search;
     let q = options.q.as_deref().unwrap_or("").trim();
     if q.is_empty() {
         return Ok(Json(json!({"items":[], "shops":[]})));
@@ -105,8 +96,51 @@ async fn execute_query(search: &Search, options: &SearchQuery) -> Result {
     .map_err(unavailable)?
     .map_err(unavailable)?;
 
-    let shops: Vec<_> = shops.hits.into_iter().map(|hit| hit.result).collect();
-    Ok(Json(json!({"items":items, "shops":shops})))
+    let shops = shops.hits.into_iter().map(|hit| hit.result);
+    let products = hit_ids(items);
+    let shops = hit_ids(shops);
+    visible_hits(&app.db, &products, &shops).await
+}
+
+fn hit_ids(hits: impl IntoIterator<Item = Value>) -> Vec<i64> {
+    hits.into_iter()
+        .filter_map(|hit| hit["id"].as_i64())
+        .collect()
+}
+
+pub(super) async fn visible_hits(db: &MySqlPool, products: &[i64], shops: &[i64]) -> Result {
+    let mut product_rows = HashMap::new();
+    let mut shop_rows = HashMap::new();
+    if !products.is_empty() || !shops.is_empty() {
+        // Search indexing is asynchronous. Use the source of truth for visibility and prices.
+        let rows: Vec<(bool, i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT TRUE,p.id,p.name,(SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled)
+             FROM JSON_TABLE(?, '$[*]' COLUMNS(id BIGINT PATH '$')) hits
+             JOIN products p ON p.id=hits.id JOIN shops s ON s.id=p.shop_id
+             WHERE p.status='active' AND NOT s.suspended
+             UNION ALL
+             SELECT FALSE,s.id,s.name,NULL
+             FROM JSON_TABLE(?, '$[*]' COLUMNS(id BIGINT PATH '$')) hits
+             JOIN shops s ON s.id=hits.id WHERE NOT s.suspended",
+        )
+        .bind(json!(products).to_string())
+        .bind(json!(shops).to_string())
+        .fetch_all(db)
+        .await?;
+        for (product, id, name, price) in rows {
+            if product {
+                product_rows.insert(id, json!({"id":id,"name":name,"lowest_price":price}));
+            } else {
+                shop_rows.insert(id, json!({"id":id,"name":name}));
+            }
+        }
+    }
+    let items: Vec<_> = products
+        .iter()
+        .filter_map(|id| product_rows.remove(id))
+        .collect();
+    let shops: Vec<_> = shops.iter().filter_map(|id| shop_rows.remove(id)).collect();
+    Ok(Json(json!({"items":items,"shops":shops})))
 }
 
 impl Search {

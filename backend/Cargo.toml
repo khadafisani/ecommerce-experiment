@@ -7,11 +7,12 @@ rust-version = "1.100"
 [dependencies]
 axum = { version = "=0.8.9", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "mysql", "json", "migrate", "macros", "chrono"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "tls-native-tls", "mysql", "json", "migrate", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+url = "2.5"
+time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 argon2 = "0.6"
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 sha2 = "0.11"
@@ -20,7 +21,7 @@ csv = "1.4"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls", "jwt_rust_crypto"] }
+meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls", "jwt_aws_lc_rs"] }
 lettre = { version = "0.11.24", features = ["tokio1-native-tls"] }
 hex = "0.4"
 img4avif = { version = "0.7", default-features = false }
@@ -29,3 +30,11 @@ fastembed = { version = "=7.7.1", default-features = false, features = ["ort-dow
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "compression-zstd", "fs", "trace"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+# Allow AWS-LC to build on Windows when NASM is unavailable.
+aws-lc-rs = { version = "1.19", default-features = false, features = ["prebuilt-nasm"] }
+
+[patch.crates-io]
+# Remove this adapter when rav1e and tokenizers no longer require paste.
+paste = { path = "compat/paste" }

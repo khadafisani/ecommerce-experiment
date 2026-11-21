@@ -49,7 +49,8 @@
     const controller = new AbortController();
     pending = controller;
     try {
-      const response = await fetch('/api/search' + params({ q: term }), { signal: controller.signal });
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]);
+      const response = await fetch('/api/search' + params({ q: term }), { signal });
       if (!response.ok) throw new Error('Search unavailable');
       const result: SearchResponse = await response.json();
       if (controller.signal.aborted) return;

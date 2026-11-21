@@ -1,7 +1,8 @@
 -- Account numbers are stable so people can share the same testing scenarios.
 INSERT INTO users(email,name,password,admin,created_at,updated_at)
-VALUES ('admin@seed.tosca.invalid','Fixture Administrator',@seed_password,TRUE,@seed_now,@seed_now);
+VALUES ('admin@seed.tosca.invalid','Fixture Administrator','!',TRUE,@seed_now,@seed_now);
 SET @seed_admin = LAST_INSERT_ID();
+INSERT INTO user_credentials(user_id,password_hash) VALUES (@seed_admin,@seed_password);
 
 CREATE TEMPORARY TABLE fixture_buyer (
     n INT PRIMARY KEY, email VARCHAR(254), display_name VARCHAR(120), city VARCHAR(60)
@@ -14,7 +15,9 @@ SELECT seq, CONCAT('buyer',LPAD(seq,3,'0'),'@seed.tosca.invalid'),
 FROM seq_1_to_240;
 
 INSERT INTO users(email,name,password,suspended,created_at,updated_at)
-SELECT email,display_name,@seed_password,n=240,@seed_now-INTERVAL 1460 DAY,@seed_now FROM fixture_buyer;
+SELECT email,display_name,'!',n=240,@seed_now-INTERVAL 1460 DAY,@seed_now FROM fixture_buyer;
+INSERT INTO user_credentials(user_id,password_hash)
+SELECT u.id,@seed_password FROM users u JOIN fixture_buyer f ON f.email=u.email;
 
 CREATE TEMPORARY TABLE fixture_shop (
     n INT PRIMARY KEY, short_name VARCHAR(120), owner_email VARCHAR(254)
@@ -26,12 +29,17 @@ SELECT seq, CONCAT(ELT(1+MOD(seq-1,8),'Pagi','Ruang','Awan','Laras','Taman','Rim
 FROM seq_1_to_24;
 
 INSERT INTO users(email,name,password,created_at,updated_at)
-SELECT owner_email,CONCAT(short_name,' Owner'),@seed_password,@seed_now-INTERVAL 1460 DAY,@seed_now FROM fixture_shop;
+SELECT owner_email,CONCAT(short_name,' Owner'),'!',@seed_now-INTERVAL 1460 DAY,@seed_now FROM fixture_shop;
+INSERT INTO user_credentials(user_id,password_hash)
+SELECT u.id,@seed_password FROM users u JOIN fixture_shop f ON f.owner_email=u.email;
 INSERT INTO users(email,name,password,created_at,updated_at)
 SELECT CONCAT('staff',LPAD(s.n,2,'0'),'-',r.seq,'@seed.tosca.invalid'),
        CONCAT(s.short_name,ELT(r.seq,' Fulfillment',' Catalog')),
-       @seed_password,@seed_now-INTERVAL 1460 DAY,@seed_now
+       '!',@seed_now-INTERVAL 1460 DAY,@seed_now
 FROM fixture_shop s CROSS JOIN seq_1_to_2 r;
+INSERT INTO user_credentials(user_id,password_hash)
+SELECT u.id,@seed_password FROM fixture_shop s CROSS JOIN seq_1_to_2 r
+JOIN users u ON u.email=CONCAT('staff',LPAD(s.n,2,'0'),'-',r.seq,'@seed.tosca.invalid');
 
 INSERT INTO shops(name,owner_id,suspended,created_at,updated_at)
 SELECT fs.short_name,u.id,fs.n=24,@seed_now-INTERVAL 1460 DAY,@seed_now
@@ -196,11 +204,11 @@ SELECT n,position_no,SUM(price*quantity),SUM(grams*quantity),
        FLOOR((SUM(price*quantity)*@seed_tax+5000)/10000)
 FROM fixture_line GROUP BY n,position_no;
 
-INSERT INTO checkouts(checkout_no,user_id,address,subtotal,tax,shipping,total,payment,paid_by,created_at,updated_at)
+INSERT INTO checkouts(checkout_no,user_id,address,subtotal,tax,shipping,total,payment,paid_by,created_at,updated_at,stock_reserved)
 SELECT c.checkout_no,c.buyer,c.address,sum_order.subtotal,sum_order.tax,sum_order.shipping,
        sum_order.subtotal+sum_order.tax+sum_order.shipping,
        CASE WHEN c.historical THEN 'paid' WHEN c.scenario=0 THEN 'waiting' WHEN c.scenario=7 THEN 'cancelled' ELSE 'paid' END,
-       IF(c.historical OR c.scenario NOT IN (0,7),@seed_admin,NULL),c.created,c.created
+       IF(c.historical OR c.scenario NOT IN (0,7),@seed_admin,NULL),c.created,c.created,FALSE
 FROM fixture_checkout c JOIN (
     SELECT n,SUM(subtotal) subtotal,SUM(shipping) shipping,SUM(tax) tax FROM fixture_total GROUP BY n
 ) sum_order ON sum_order.n=c.n

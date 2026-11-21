@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ArrowLeft, ArrowRight, CreditCard, MapPin, Package, ShoppingBag, Store, Truck } from '@lucide/svelte';
-  import { api, checkedGuestCart, date, downloadReturnMedia, guestCart, guestSession, key, label, message, money, params, recommendedProducts, recordProductView, save, setGuest, signedIn, type ItemPick, type Row } from './api';
+  import { api, authenticate, checkedGuestCart, date, downloadReturnMedia, guestCart, guestSession, isPublicMedia, key, label, message, money, params, recommendedProducts, recordProductView, setGuest, signedIn, trackingUrl, type ItemPick, type Row } from './api';
   import { CursorPager } from './cursor-pager.svelte';
   import CursorMore from './CursorMore.svelte';
   import ProductGrid from './ProductGrid.svelte';
@@ -17,44 +17,61 @@
   let error=$state(''), feedback=$state(''), loading=$state(true), pending=$state(false);
   let variantId=$state<number|undefined>(), quantity=$state(1), selected=$state<number[]>([]);
   let variant=$derived(data?.variants?.find((v:Row)=>v.id===variantId));
+  let validQuantity = $derived(variant && Number.isInteger(quantity) && quantity >= 1 && quantity <= Math.min(999, variant.stock));
   const pager = new CursorPager<Row & {id:number}>();
   let q=$state(''), orderTracking=$state<Row|null>(null);
   let addressId=$state<number|undefined>(), summary=$state<Row|null>(null);
-  let quoteVersion=0;
+  const lifetime = new AbortController();
+  let quoteController: AbortController | undefined;
   let addressKey=key();
-  function readCheckout(): {items:ItemPick[];from_cart:boolean;guest_cart?:boolean;key:string} | null {
-    try{return JSON.parse(sessionStorage.getItem('checkout-picks') ?? 'null');}catch{return null;}
+  type Checkout = {items:ItemPick[];from_cart:boolean;guest_cart?:boolean;key:string};
+  function readCheckout(): Checkout | null {
+    try {
+      const value = JSON.parse(sessionStorage.getItem('checkout-picks') ?? 'null');
+      if (!value || typeof value.key !== 'string' || !Array.isArray(value.items) || !value.items.length
+        || value.items.length > 100 || !value.items.every((item: ItemPick) => item != null && Number.isSafeInteger(item.id)
+          && item.id > 0 && Number.isInteger(item.quantity) && item.quantity >= 1 && item.quantity <= 999)) return null;
+      return { items: value.items, from_cart: value.from_cart === true, guest_cart: value.guest_cart === true, key: value.key };
+    } catch { return null; }
   }
-  const checkout=readCheckout();
-  onMount(()=>{ void load(); });
+  const checkout=$derived(page === 'checkout' ? readCheckout() : null);
+  const get = <T = Row>(path: string, signal = lifetime.signal) => api<T>(path, 'GET', undefined, true, signal);
+  onMount(()=>{
+    void load();
+    return () => {
+      lifetime.abort();
+      quoteController?.abort();
+      pager.cancel();
+    };
+  });
   async function load() {
     if(page==='orders'&&!id&&signedIn()) {
       const query=q;
       loading=false;
-      await pager.reset(cursor=>api('/checkout'+params({q:query,cursor})));
+      await pager.reset((cursor, signal)=>get('/checkout'+params({q:query,cursor}), signal));
       return;
     }
     loading=true;error='';
     try {
       if(page==='product') {
-        const product=await api('/products/'+id);
+        const product=await get('/products/'+id);
         data=product;
         variantId=product.variants.find((v:Row)=>v.stock>0)?.id??product.variants[0]?.id;
         recommendations = [];
-        void recordProductView(product.id).then(() => recommendedProducts(product.id)).then(items => {
+        void recordProductView(product.id).then(() => recommendedProducts(product.id, lifetime.signal)).then(items => {
           if (data?.id === product.id) recommendations = items;
         }).catch(() => {});
       } else if(page==='cart') {
-        rows=signedIn()&&!guestSession()?await api<Row[]>('/cart'):await checkedGuestCart();
+        rows=signedIn()&&!guestSession()?await get<Row[]>('/cart'):await checkedGuestCart(lifetime.signal);
         selected=rows.filter(v=>!v.reason).map(v=>v.id);
       } else if(page==='checkout' && signedIn()) {
-        addresses=await api<Row[]>('/addresses');
+        addresses=await get<Row[]>('/addresses');
         addressId=addresses[0]?.id;
         await getQuote();
       } else if(page==='orders'&&signedIn()) {
-        if(id) data=await api('/checkout/'+id);
-      } else if(page==='notifications'&&signedIn()) rows=await api<Row[]>('/notifications');
-    }catch(e){error=message(e);}finally{loading=false;}
+        if(id) data=await get('/checkout/'+id);
+      } else if(page==='notifications'&&signedIn()) rows=await get<Row[]>('/notifications');
+    }catch(e){if(!lifetime.signal.aborted)error=message(e);}finally{authenticated=signedIn();loading=false;}
   }
   async function act(operation:()=>Promise<void>) {
     if(pending)return;
@@ -71,43 +88,64 @@
       if(signedIn()&&!guestSession()) await api('/cart/'+row.id,'PUT',{quantity:next});
       else setGuest(row.id,next);
       const active=selected;
-      rows=signedIn()&&!guestSession()?await api<Row[]>('/cart'):await checkedGuestCart();
+      rows=signedIn()&&!guestSession()?await get<Row[]>('/cart'):await checkedGuestCart(lifetime.signal);
       selected=rows.filter(v=>!v.reason&&active.includes(v.id)).map(v=>v.id);
       await changed();
     });
   }
+  function changeQuantity(event: Event & { currentTarget: HTMLInputElement }, row: Row) {
+    const input = event.currentTarget;
+    if (!input.validity.valid || !Number.isInteger(input.valueAsNumber)) {
+      input.value = String(row.quantity);
+      error = 'Enter a quantity from 1 to 999.';
+      return;
+    }
+    const next = input.valueAsNumber;
+    void updateCart(row, next).then(() => {
+      input.value = String(rows.find(item => item.id === row.id)?.quantity ?? row.quantity);
+    });
+  }
   function start(items:ItemPick[],from_cart:boolean) {
+    if (!items.length || items.length > 100) {
+      error = 'Select 1 to 100 items to check out.';
+      return;
+    }
     const guest_cart=from_cart&&(!signedIn()||guestSession());
     sessionStorage.setItem('checkout-picks',JSON.stringify({items,from_cart:from_cart&&!guest_cart,guest_cart,key:key()}));
     location.assign('/checkout');
   }
   async function addProduct() {
-    if(!data||!variant)return;
+    if(!data||!variant||!validQuantity)return;
+    const line = variant;
+    const amount = quantity;
     const item={product_id:data.id,product_name:data.name,image:data.image,shop:data.shop,variant:variant.name,subvariant:variant.subvariant,price:variant.price};
     await act(async()=>{
-      const line=variant!;
       if(signedIn()&&!guestSession()) {
-        const old=(await api<Row[]>('/cart')).find(r=>r.id===line.id)?.quantity??0;
-        await api('/cart/'+line.id,'PUT',{quantity:old+quantity});
+        await api('/cart/'+line.id,'POST',{quantity:amount});
       }else {
         const old=guestCart().find(r=>r.id===line.id)?.quantity??0;
-        if(old+quantity>line.stock) throw new Error('This quantity exceeds available stock');
-        setGuest(line.id,old+quantity,item);
+        if(old+amount>line.stock) throw new Error('This quantity exceeds available stock');
+        setGuest(line.id,old+amount,item);
       }
       feedback='Added to your cart.';
       await changed();
     });
   }
   async function getQuote() {
-    const version=++quoteVersion;
+    quoteController?.abort();
     summary=null;error='';
     if (!addressId||!checkout)return;
-    try {const quote=await api('/checkout/quote','POST',{...checkout,from_cart:checkout.from_cart || Boolean(checkout.guest_cart && !guestSession()),address:addressId});if(version===quoteVersion)summary=quote;}
-    catch(e){if(version===quoteVersion)error=message(e);}
+    const controller = new AbortController();
+    quoteController = controller;
+    try {
+      const quote=await api('/checkout/quote','POST',{...checkout,from_cart:checkout.from_cart || Boolean(checkout.guest_cart && !guestSession()),address:addressId},true,controller.signal);
+      if(!controller.signal.aborted)summary=quote;
+    } catch(e){if(!controller.signal.aborted)error=message(e);}
+    finally { if (quoteController === controller) quoteController = undefined; }
   }
   async function addAddress(input:Row) {
     const result=await api('/addresses','POST',{...input,key:addressKey});
-    addresses=await api<Row[]>('/addresses');
+    addresses=await get<Row[]>('/addresses');
     addressId=result.id;addressKey=key();await getQuote();
   }
   async function placeOrder() {
@@ -120,7 +158,7 @@
   }
   async function continueAsGuest() {
     await act(async()=>{
-      save(await api('/auth/guest','POST'),true);
+      await authenticate('guest');
       authenticated=true;
       await load();
     });
@@ -133,13 +171,14 @@
     if(page==='return')await api('/orders/'+id+'/return','POST',input);
     else await api('/orders/'+id+'/reviews','POST',{...input,rating:Number(input.rating),product_id:Number(parts[2])});
     const checkoutId=new URLSearchParams(location.search).get('checkout');
-    location.assign(checkoutId?'/orders/'+checkoutId+'?submitted='+page:'/orders');
+    location.assign(checkoutId && /^[1-9][0-9]*$/.test(checkoutId)?'/orders/'+checkoutId+'?submitted='+page:'/orders');
   }
   const submitted=new URLSearchParams(location.search).get('submitted');
 </script>
 
 {#snippet media(files:string[])}
-  {#if files?.length}<div class="media-row">{#each files as file (file)}
+  {@const attachments = Array.isArray(files) ? [...new Set(files.filter(isPublicMedia))] : []}
+  {#if attachments.length}<div class="media-row">{#each attachments as file (file)}
     {#if /\.(mp4|webm)$/.test(file)}<video src={file} controls aria-label="Customer attachment"><track kind="captions" /></video>
     {:else}<a href={file} target="_blank" rel="noreferrer"><ResponsiveImage src={file} alt="Customer attachment" sizes="106px" uploadSize="thumbnail" /></a>{/if}
   {/each}</div>{/if}
@@ -167,8 +206,8 @@
       <div class="field-row"><label>Variant<select bind:value={variantId} onchange={()=>quantity=1}>{#each data.variants as v (v.id)}<option value={v.id} disabled={!v.stock}>{v.name}{v.subvariant?' / '+v.subvariant:''}{v.stock?'':' · Out of stock'}</option>{/each}</select></label>
       <label>Quantity<input type="number" min="1" max={Math.min(999,variant?.stock??1)} bind:value={quantity}></label></div>
       {#if variant}<p class="muted">{variant.stock} in stock · {variant.grams} g</p>{/if}
-      <div class="actions"><button disabled={pending||!variant||quantity<1||quantity>variant.stock||!quantity} onclick={addProduct}><ShoppingBag size={17}/> Add to cart</button>
-        <button class="primary" disabled={!variant||quantity<1||quantity>variant.stock||!quantity} onclick={()=>start([{id:variantId!,quantity}],false)}>Buy now <ArrowRight size={16}/></button></div>
+      <div class="actions"><button disabled={pending||!validQuantity} onclick={addProduct}><ShoppingBag size={17}/> Add to cart</button>
+        <button class="primary" disabled={pending||!validQuantity} onclick={()=>start([{id:variantId!,quantity}],false)}>Buy now <ArrowRight size={16}/></button></div>
       {#if feedback}<p class="feedback" role="status">{feedback}</p>{/if}
     </div>
   </section>
@@ -182,10 +221,10 @@
         <input type="checkbox" aria-label={'Select '+row.product_name} value={row.id} bind:group={selected} disabled={Boolean(row.reason)}>
         <a class="thumb" href={'/product/'+row.product_id} aria-label={row.product_name}>{#if row.image}<ResponsiveImage src={row.image} alt="" sizes="58px" uploadSize="thumbnail" />{:else}<ProductInitials name={row.product_name}/>{/if}</a>
         <div class="cart-product"><a href={'/product/'+row.product_id}><strong>{row.product_name}</strong></a><small>{row.variant}{row.subvariant?' / '+row.subvariant:''} · {row.shop}</small><small>Added {ago(row.created_at).toLowerCase()}</small>{#if row.reason}<span class="badge">{row.reason}</span>{/if}</div>
-        <label class="quantity"><span class="sr-only">Quantity for {row.product_name}</span><input type="number" min="1" max="999" value={row.quantity} disabled={pending||Boolean(row.reason)} onchange={(e)=>updateCart(row,Number(e.currentTarget.value))}></label>
+        <label class="quantity"><span class="sr-only">Quantity for {row.product_name}</span><input type="number" min="1" max="999" value={row.quantity} disabled={pending||Boolean(row.reason)} onchange={(e)=>changeQuantity(e,row)}></label>
         <strong>{money(row.price)}</strong><button class="text-button" disabled={pending} onclick={()=>updateCart(row,0)}>Remove</button>
       </article>{/each}
-    </div><aside class="panel totals"><h2>Order summary</h2><div class="split"><span>Selected items</span><strong>{chosen.length}</strong></div><div class="split"><span>Subtotal</span><strong>{money(total)}</strong></div><button class="primary" disabled={!chosen.length} onclick={()=>start(chosen.map(({id,quantity})=>({id,quantity})),true)}>Checkout <ArrowRight size={17}/></button></aside></div>
+    </div><aside class="panel totals"><h2>Order summary</h2><div class="split"><span>Selected items</span><strong>{chosen.length}</strong></div><div class="split"><span>Subtotal</span><strong>{money(total)}</strong></div><button class="primary" disabled={pending||!chosen.length} onclick={()=>start(chosen.map(({id,quantity})=>({id,quantity})),true)}>Checkout <ArrowRight size={17}/></button></aside></div>
   {:else}<section class="panel empty"><ShoppingBag size={28}/><h2>Your cart is empty</h2><a class="primary" href="/">Explore products</a></section>{/if}
 {:else if page==='checkout'}
   <a class="breadcrumb" href="/cart"><ArrowLeft size={16}/> Cart</a><h1>Checkout</h1>
@@ -242,10 +281,11 @@
 {/if}
 
 {#if orderTracking}
+  {@const courierLink = trackingUrl(orderTracking.courier_url)}
   <dialog open class="dialog" aria-label="Shipping progress">
     <div class="split"><h2>Shipping progress</h2><button onclick={()=>orderTracking=null}>Close</button></div>
     <p>{orderTracking.courier} · {orderTracking.receipt}</p>
-    {#if orderTracking.courier_url}<a href={orderTracking.courier_url} target="_blank" rel="noreferrer">Open courier tracking</a>{/if}
+    {#if courierLink}<a href={courierLink} target="_blank" rel="noreferrer">Open courier tracking</a>{/if}
     {#each orderTracking.tracking as event,i (i)}<div class="split review"><span>{event.note}</span><small>{date(event.created_at)}</small></div>{:else}<p>No tracking updates yet.</p>{/each}
   </dialog><div class="backdrop"></div>
 {/if}

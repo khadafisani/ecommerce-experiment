@@ -5,9 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use sqlx::AssertSqlSafe;
+use time::{
+    OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339, macros::format_description,
+};
+
+use crate::format_database_datetime;
 
 pub(super) fn routes() -> Router<App> {
     Router::new()
@@ -123,8 +127,8 @@ async fn merchant_history(
 #[derive(sqlx::FromRow)]
 struct Version {
     record_id: i64,
-    valid_from: DateTime<Utc>,
-    valid_until: Option<DateTime<Utc>>,
+    valid_from: OffsetDateTime,
+    valid_until: Option<OffsetDateTime>,
     snapshot: sqlx::types::Json<serde_json::Value>,
 }
 
@@ -173,8 +177,8 @@ async fn history_page(
             json!({
                 "id": version.key(),
                 "record_id": version.record_id,
-                "valid_from": version.valid_from,
-                "valid_until": version.valid_until,
+                "valid_from": format_version_timestamp(version.valid_from),
+                "valid_until": version.valid_until.map(format_version_timestamp),
                 "snapshot": version.snapshot.0,
             })
         })
@@ -188,19 +192,59 @@ async fn history_page(
 
 impl Version {
     fn key(&self) -> String {
-        format!(
-            "{}|{}",
-            self.valid_from.to_rfc3339_opts(SecondsFormat::Micros, true),
-            self.record_id
-        )
+        let timestamp = self
+            .valid_from
+            .format(format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]Z"
+            ))
+            .expect("database timestamps have every datetime component");
+        format!("{timestamp}|{}", self.record_id)
     }
 }
 
-fn parse_cursor(cursor: &str) -> Result<(DateTime<Utc>, i64)> {
+fn format_version_timestamp(timestamp: OffsetDateTime) -> String {
+    // SQLx decodes these database timestamps as UTC.
+    format!(
+        "{}Z",
+        format_database_datetime(timestamp.date().with_time(timestamp.time()))
+    )
+}
+
+fn parse_cursor(cursor: &str) -> Result<(OffsetDateTime, i64)> {
     let invalid = || Error::bad("Invalid history cursor");
     let (timestamp, id) = cursor.split_once('|').ok_or_else(invalid)?;
-    Ok((
-        timestamp.parse().map_err(|_| invalid())?,
-        id.parse().map_err(|_| invalid())?,
-    ))
+    let timestamp = OffsetDateTime::parse(timestamp, &Rfc3339)
+        .map_err(|_| invalid())?
+        .checked_to_offset(UtcOffset::UTC)
+        .ok_or_else(invalid)?;
+    Ok((timestamp, id.parse().map_err(|_| invalid())?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Version, format_version_timestamp, parse_cursor};
+    use serde_json::Value;
+    use sqlx::types::Json;
+    use time::macros::datetime;
+
+    #[test]
+    fn round_trips_existing_history_cursors() {
+        let cursor = "2026-11-21T08:09:10.100000Z|42";
+        let Ok((valid_from, record_id)) = parse_cursor(cursor) else {
+            panic!("previously issued history cursor must still parse");
+        };
+        assert_eq!(valid_from, datetime!(2026-11-21 08:09:10.1 UTC));
+        assert_eq!(record_id, 42);
+        assert_eq!(
+            format_version_timestamp(valid_from),
+            "2026-11-21T08:09:10.100Z"
+        );
+        let version = Version {
+            record_id,
+            valid_from,
+            valid_until: None,
+            snapshot: Json(Value::Null),
+        };
+        assert_eq!(version.key(), cursor);
+    }
 }

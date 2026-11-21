@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ArrowRight, Bell, ChevronDown, ChevronRight, Package, ShoppingBag, Store, Truck, UserRound } from '@lucide/svelte';
-  import { api, clear, exploreRecommendations, groupSearchHits, guestCart, guestSession, key, logout, mergeGuestCart, message, params, save, signedIn, type Row, type SearchGroups, type SearchResponse } from './api';
+  import { api, authenticate, exploreRecommendations, groupSearchHits, guestCart, guestSession, key, localRedirect, logout, message, params, signedIn, watchSessionIdentity, type Row, type SearchGroups, type SearchResponse } from './api';
   import { CursorPager } from './cursor-pager.svelte';
   import CursorMore from './CursorMore.svelte';
   import CategoryNav from './CategoryNav.svelte';
@@ -15,6 +15,13 @@
   const portal = page === 'merchant' || page === 'admin' ? page : 'customer';
   const authPage = ['login','register','forgot','reset'].includes(portal==='customer'?page:parts[1]) && !(portal==='admin'&&parts[1]==='register');
   const mode = portal==='customer'?page:parts[1];
+  const resetToken = mode === 'reset'
+    ? new URLSearchParams(location.hash.slice(1)).get('token') ?? search.get('token')
+    : null;
+  if (resetToken) {
+    search.delete('token');
+    history.replaceState(history.state, '', location.pathname + (search.size ? '?' + search : ''));
+  }
   const browse = page === '' || page === 'search' || page === 'shop';
   const category = search.get('category');
   const storefrontHome = page === '' && !category;
@@ -23,7 +30,7 @@
   const pager = new CursorPager<Row & {id:number}, number | string>();
   let sort = $state<'for-you' | 'newest' | 'oldest'>(storefrontHome ? 'for-you' : 'newest');
   let hasForYou = $state(storefrontHome);
-  let busy=$state(browse), error=$state(''), authNotice=$state('');
+  let busy=$state(browse), error=$state(''), authNotice=$state(''), signOutPending=$state(false), signOutError=$state('');
   const prefix = portal==='customer'?'':'/'+portal;
   const email: Field = {name:'email',label:'Email address',type:'email'};
   const password: Field = {name:'password',label:'Password',type:'password'};
@@ -33,15 +40,16 @@
   let catalogError = $derived(page==='search' ? error : pager.cursor===null ? pager.error : '');
   const shopKey=key();
   let catalogRevision = 0;
+  const lifetime = new AbortController();
 
   async function load() {
     const revision = ++catalogRevision;
     if(page!=='search') {
       if (sort === 'for-you') {
         const fetchPage = exploreRecommendations();
-        await pager.reset(async cursor => {
-          const result = await fetchPage(typeof cursor === 'string' ? cursor : null);
-          if (!result.enabled && revision === catalogRevision) {
+        await pager.reset(async (cursor, signal) => {
+          const result = await fetchPage(typeof cursor === 'string' ? cursor : null, signal);
+          if (!result.enabled && !signal.aborted && revision === catalogRevision) {
             hasForYou = false;
             sort = 'newest';
             void load();
@@ -55,14 +63,14 @@
         return;
       }
       const filters={category,sort,shop:page==='shop'?parts[1]:null};
-      await pager.reset(cursor=>api('/products'+params({...filters,cursor})));
+      await pager.reset((cursor, signal)=>api('/products'+params({...filters,cursor}), 'GET', undefined, true, signal));
       return;
     }
     busy=true;error='';
     try {
-      const result=await api<SearchResponse>('/search'+params({q:search.get('q')}));
+      const result=await api<SearchResponse>('/search'+params({q:search.get('q')}), 'GET', undefined, true, lifetime.signal);
       searchGroups=groupSearchHits(result);
-    }catch(e){error=message(e);}finally{busy=false;}
+    }catch(e){if(!lifetime.signal.aborted)error=message(e);}finally{busy=false;}
   }
 
   function selectSort(event: Event & { currentTarget: HTMLSelectElement }) {
@@ -79,6 +87,10 @@
   }
 
   onMount(()=>{
+    const unwatch = watchSessionIdentity(() => {
+      continuingCheckout = true;
+      location.reload();
+    });
     const continueCheckout=()=>{continuingCheckout=true;};
     window.addEventListener('tosca-checkout-auth',continueCheckout);
     if (page === 'checkout') window.addEventListener('beforeunload', checkoutLeave);
@@ -86,27 +98,35 @@
       void load();
     }
     if(signedIn()) {
-      api('/auth/me').then(value=>account=value).catch(()=>{});
+      api('/auth/me', 'GET', undefined, true, lifetime.signal).then(value=>account=value).catch(()=>{});
       void updateCount();
     }
     return () => {
+      unwatch();
+      lifetime.abort();
+      catalogRevision++;
+      pager.cancel();
       window.removeEventListener('tosca-checkout-auth', continueCheckout);
       if (page === 'checkout') window.removeEventListener('beforeunload', checkoutLeave);
     };
   });
   async function updateCount() {
-    try { cartCount=(signedIn()&&!guestSession()?await api<Row[]>('/cart'):guestCart()).reduce((sum,row)=>sum+row.quantity,0); } catch {}
+    try { cartCount=(signedIn()&&!guestSession()?await api<Row[]>('/cart', 'GET', undefined, true, lifetime.signal):guestCart()).reduce((sum,row)=>sum+row.quantity,0); } catch {}
   }
   async function submitAuth(data:Row) {
     if(mode==='forgot') {await api('/auth/forgot','POST',data);authNotice='If an account matches this email, a reset link will arrive shortly.';return;}
-    if(mode==='reset') {await api('/auth/reset','POST',{...data,token:search.get('token')});location.assign('/login');return;}
-    save(await api('/auth/'+mode,'POST',{...data,portal}),false);
-    if(portal==='customer') await mergeGuestCart().catch(()=>{});
-    const next=search.get('next');
-    location.assign(next?.startsWith('/')&&!next.startsWith('//')&&!next.includes('\\')?next:prefix||'/');
+    if(mode==='reset') {await api('/auth/reset','POST',{...data,token:resetToken});location.assign('/login');return;}
+    if (mode !== 'login' && mode !== 'register') return;
+    await authenticate(mode, {...data,portal}, { importGuestCart: portal === 'customer' });
+    location.assign(localRedirect(search.get('next'), prefix||'/'));
   }
   async function signOut() {
-    try {await logout();location.assign('/');} catch(e){clear();error=message(e);location.assign('/');}
+    if (signOutPending) return;
+    signOutPending = true;
+    signOutError = '';
+    try { await logout(); location.assign('/'); }
+    catch (e) { signOutError=message(e); }
+    finally { signOutPending=false; }
   }
   let continuingCheckout=false;
   function checkoutLeave(event: BeforeUnloadEvent) {
@@ -128,7 +148,7 @@
       <a href="/cart" class="icon-button cart-icon" aria-label={'Cart, '+cartCount+' items'}><ShoppingBag size={21}/>{#if cartCount}<span>{cartCount}</span>{/if}</a>
       {#if account}
         <details class="profile-menu"><summary><span class="avatar"><UserRound size={16}/></span><span>{account.user.name}</span><ChevronDown size={14}/></summary>
-          <div class="dropdown"><a href="/profile">Profile</a><a href="/orders">Orders</a><a href="/notifications"><Bell size={15}/> Notifications</a>{#if account.user.admin}<a href="/admin">Admin dashboard</a>{/if}<button onclick={signOut}>Log out</button></div>
+          <div class="dropdown"><a href="/profile">Profile</a><a href="/orders">Orders</a><a href="/notifications"><Bell size={15}/> Notifications</a>{#if account.user.admin}<a href="/admin">Admin dashboard</a>{/if}<button disabled={signOutPending} onclick={signOut}>Log out</button>{#if signOutError}<p class="error" role="alert">{signOutError}</p>{/if}</div>
         </details>
       {:else}<a class="signin" href="/login"><UserRound size={17}/> <span>Sign in</span></a>{/if}
     </div>

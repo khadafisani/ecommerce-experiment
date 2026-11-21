@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 pub const PUBLIC_DIR: &str = "uploads";
 pub const PRIVATE_DIR: &str = "private-uploads";
-pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 static IMAGE_ENCODERS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Clone, Copy, Deserialize)]
@@ -61,7 +61,7 @@ impl ImageSize {
 }
 
 pub async fn save_image(directory: &str, stem: String, bytes: Bytes) -> Result<()> {
-    let permit = IMAGE_ENCODERS.acquire().await.map_err(Error::internal)?;
+    let permit = IMAGE_ENCODERS.try_acquire().map_err(|_| Error::busy())?;
     let directory = PathBuf::from(directory);
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -72,7 +72,7 @@ pub async fn save_image(directory: &str, stem: String, bytes: Bytes) -> Result<(
             .collect();
         let config = Config::default()
             .max_pixels(20_000_000)
-            .max_input_bytes(MAX_IMAGE_BYTES as u64)
+            .max_input_bytes(MAX_FILE_BYTES as u64)
             .output_resolutions(resolutions);
         let images = Converter::new(config)
             .and_then(|converter| converter.convert_multi(&bytes))
@@ -118,16 +118,35 @@ fn publish_images(directory: &Path, stem: &str, images: Vec<ConversionOutput>) -
 
 pub fn public_files(
     directory: impl Into<PathBuf>,
-) -> ServeDir<
-    impl Service<Request, Response = Response, Error = Infallible, Future: Send + 'static>
-    + Clone
-    + Send
-    + Sync,
-> {
+) -> impl Service<Request, Response = Response, Error = Infallible, Future: Send + 'static>
++ Clone
++ Send
++ Sync {
     let directory = directory.into();
-    ServeDir::new(&directory).fallback(service_fn(move |request| {
+    let files = ServeDir::new(&directory).fallback(service_fn(move |request| {
         serve_original(directory.clone(), request)
-    }))
+    }));
+    service_fn(move |request: Request| {
+        let files = files.clone();
+        async move {
+            if !public_filename(request.uri().path()) {
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            }
+            let response = files.oneshot(request).await?;
+            Ok(response.map(Body::new))
+        }
+    })
+}
+
+fn public_filename(path: &str) -> bool {
+    let Some((stem, extension)) = path
+        .strip_prefix('/')
+        .and_then(|name| name.rsplit_once('.'))
+    else {
+        return false;
+    };
+    matches!(extension, "avif" | "mp4" | "webm")
+        && (Uuid::parse_str(stem).is_ok() || original_stem(path).is_some())
 }
 
 async fn serve_original(
@@ -149,15 +168,24 @@ fn original_stem(path: &str) -> Option<&str> {
         .then_some(stem)
 }
 
-pub async fn read_private(name: &str, size: Option<ImageSize>) -> io::Result<Vec<u8>> {
+pub async fn serve_private(
+    name: &str,
+    size: Option<ImageSize>,
+    request: Request,
+) -> Result<Response> {
     let directory = Path::new(PRIVATE_DIR);
+    let mut path = directory.join(name);
     if let (Some(stem), Some(size)) = (name.strip_suffix(".avif"), size) {
-        match tokio::fs::read(directory.join(size.filename(stem))).await {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            result => return result,
+        let variant = directory.join(size.filename(stem));
+        if tokio::fs::try_exists(&variant)
+            .await
+            .map_err(Error::internal)?
+        {
+            path = variant;
         }
     }
-    tokio::fs::read(directory.join(name)).await
+    let Ok(response) = ServeFile::new(path).oneshot(request).await;
+    Ok(response.map(Body::new))
 }
 
 #[cfg(test)]
@@ -171,6 +199,7 @@ mod tests {
         let stem = Uuid::new_v4().to_string();
         fs::write(directory.path().join(format!("{stem}.avif")), b"original")?;
         fs::write(directory.path().join(format!("{stem}-sm.avif")), b"small")?;
+        fs::write(directory.path().join("staging-file"), b"unpublished")?;
         let router =
             Router::new().nest_service("/uploads", public_files(directory.path().to_path_buf()));
 
@@ -193,7 +222,14 @@ mod tests {
             .uri(format!("/uploads/{stem}-unknown.avif"))
             .body(Body::empty())?;
         assert_eq!(
-            router.oneshot(request).await?.status(),
+            router.clone().oneshot(request).await?.status(),
+            StatusCode::NOT_FOUND
+        );
+        let unpublished = Request::builder()
+            .uri("/uploads/staging-file")
+            .body(Body::empty())?;
+        assert_eq!(
+            router.oneshot(unpublished).await?.status(),
             StatusCode::NOT_FOUND
         );
         Ok(())

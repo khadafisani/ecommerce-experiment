@@ -53,7 +53,7 @@ async fn compare_replica(
             key.into(),
             filters.clone(),
             Vec::new(),
-            chrono::Utc::now().timestamp(),
+            time::OffsetDateTime::now_utc().unix_timestamp(),
             Vec::new(),
         )
         .await?

@@ -31,7 +31,7 @@
     && version.id !== selected.id));
 
   function load(endpoint: string, category?: string) {
-    return pager.reset(cursor => api(endpoint + params({ kind: category, cursor })));
+    return pager.reset((cursor, signal) => api(endpoint + params({ kind: category, cursor }), 'GET', undefined, true, signal));
   }
 
   $effect(() => {
@@ -39,6 +39,7 @@
     const category = kind;
     void revision;
     untrack(() => void load(endpoint, category));
+    return () => pager.cancel();
   });
 
   const timestamps = new Intl.DateTimeFormat('en-ID', { dateStyle: 'medium', timeStyle: 'medium' });

@@ -5,17 +5,17 @@ use crate::{
     uploads::{self, ImageSize},
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/cart", get(cart))
         .route("/cart/availability", post(availability))
-        .route("/cart/{id}", put(set_cart))
+        .route("/cart/{id}", put(set_cart).post(add_cart))
         .route("/addresses", get(addresses).post(add_address))
         .route("/checkout/quote", post(quote))
         .route("/checkout", get(checkouts).post(checkout))
@@ -38,7 +38,7 @@ struct Line {
     variant: String,
     subvariant: String,
     price: i64,
-    stock: i32,
+    stock: i64,
     grams: i32,
     available: bool,
 }
@@ -68,7 +68,7 @@ async fn availability(State(app): State<App>, Json(items): Json<Vec<Pick>>) -> R
         let line = lines.iter().find(|line| line.id == pick.id);
         let reason = match line {
             Some(line) if line.available && line.stock == 0 => Some("Out of stock"),
-            Some(line) if line.available && line.stock < pick.quantity => Some("Insufficient stock"),
+            Some(line) if line.available && line.stock < i64::from(pick.quantity) => Some("Insufficient stock"),
             Some(line) if line.available => None,
             _ => Some("Unavailable"),
         };
@@ -122,6 +122,56 @@ async fn set_cart(
     Ok(ok())
 }
 
+async fn add_cart(
+    State(app): State<App>,
+    user: User,
+    Path(id): Path<i64>,
+    Json(input): Json<Quantity>,
+) -> Result {
+    if !(1..=999).contains(&input.quantity) {
+        return Err(Error::bad("Choose a quantity from 1 to 999"));
+    }
+    let mut tx = app.db.begin().await?;
+    // Serialize first inserts as well as updates for this cart.
+    sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE id=? FOR UPDATE")
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let line: Line = sqlx::query_as(sqlx::AssertSqlSafe(format!("{LINE} WHERE v.id=?")))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let prior = locked_cart_quantity(&mut tx, user.id, id).await?;
+    let quantity = prior + input.quantity;
+    validate(&line, quantity)?;
+    sqlx::query(SET_CART)
+        .bind(user.id)
+        .bind(id)
+        .bind(quantity)
+        .execute(&mut *tx)
+        .await?;
+    if app.recommendations.enabled() && !user.is_guest() {
+        crate::recommendations::record_cart(&mut tx, user.id, line.product_id).await?;
+    }
+    tx.commit().await?;
+    Ok(ok())
+}
+
+async fn locked_cart_quantity(
+    tx: &mut Transaction<'_, MySql>,
+    user: i64,
+    variant: i64,
+) -> sqlx::Result<i32> {
+    let prior: Option<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM carts WHERE user_id=? AND variant_id=? FOR UPDATE",
+    )
+    .bind(user)
+    .bind(variant)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(prior.unwrap_or(0))
+}
+
 async fn set_cart_and_record(
     db: &MySqlPool,
     user: i64,
@@ -129,20 +179,18 @@ async fn set_cart_and_record(
     quantity: i32,
 ) -> sqlx::Result<()> {
     let mut tx = db.begin().await?;
-    let prior: Option<i32> = sqlx::query_scalar(
-        "SELECT quantity FROM carts WHERE user_id=? AND variant_id=? FOR UPDATE",
-    )
-    .bind(user)
-    .bind(line.id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE id=? FOR UPDATE")
+        .bind(user)
+        .fetch_one(&mut *tx)
+        .await?;
+    let prior = locked_cart_quantity(&mut tx, user, line.id).await?;
     sqlx::query(SET_CART)
         .bind(user)
         .bind(line.id)
         .bind(quantity)
         .execute(&mut *tx)
         .await?;
-    if quantity > prior.unwrap_or(0) {
+    if quantity > prior {
         crate::recommendations::record_cart(&mut tx, user, line.product_id).await?;
     }
     tx.commit().await
@@ -214,7 +262,7 @@ struct Quote {
     total: i64,
 }
 fn validate(line: &Line, qty: i32) -> Result<()> {
-    if !line.available || !(1..=999).contains(&qty) || qty > line.stock {
+    if !line.available || !(1..=999).contains(&qty) || i64::from(qty) > line.stock {
         return Err(Error::conflict(
             "An item is unavailable or has insufficient stock",
         ));
@@ -302,10 +350,33 @@ async fn quote(State(app): State<App>, user: User, Json(input): Json<Checkout>) 
     tx.commit().await?;
     Ok(Json(json!(quote)))
 }
-async fn checkout(State(app): State<App>, user: User, Json(input): Json<Checkout>) -> Result {
+async fn checkout(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    user: User,
+    Json(input): Json<Checkout>,
+) -> Result {
+    crate::auth::rate_limit(&app.db, "checkout-ip", peer.ip(), 30).await?;
+    crate::auth::rate_limit(&app.db, "checkout-user", user.id, 10).await?;
     let mut tx = app.db.begin().await?;
+    sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE id=? FOR UPDATE")
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
     if let Some(id) = claim(&mut tx, user.id, "checkout", &input.key, &input).await? {
+        tx.commit().await?;
         return Ok(Json(json!({"id":id})));
+    }
+    let unpaid: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM checkouts WHERE user_id=? AND payment='waiting' AND stock_reserved",
+    )
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if unpaid >= 5 {
+        return Err(Error::conflict(
+            "Pay or cancel an unpaid checkout before placing another",
+        ));
     }
     let q = calculate(&app, &mut tx, user.id, &input, true).await?;
     if input.expected_total.is_some_and(|total| total != q.total) {
@@ -361,7 +432,7 @@ const SUMMARY: &str = "SELECT JSON_OBJECT('id',c.id,'checkout_no',c.checkout_no,
 
 pub(super) fn before_date(
     query: &mut sqlx::QueryBuilder<MySql>,
-    cursor: Option<(chrono::NaiveDateTime, i64)>,
+    cursor: Option<(time::PlainDateTime, i64)>,
 ) {
     if let Some((created_at, id)) = cursor {
         query
@@ -465,34 +536,104 @@ async fn cancel(State(app): State<App>, user: User, Path(id): Path<i64>) -> Resu
     if paid != "waiting" {
         return Err(Error::conflict("Only unpaid checkouts can be cancelled"));
     }
-    let orders: Vec<i64> = sqlx::query_scalar("SELECT id FROM orders WHERE checkout_id=?")
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await?;
-    for order in orders {
-        restore(&mut tx, order, user.id).await?;
-    }
-    sqlx::query("UPDATE orders SET status='cancelled',actor_id=? WHERE checkout_id=?")
-        .bind(user.id)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE checkouts SET payment='cancelled' WHERE id=?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    cancel_unpaid(&mut tx, id, user.id).await?;
     tx.commit().await?;
     Ok(ok())
 }
+
+async fn cancel_unpaid(tx: &mut Transaction<'_, MySql>, id: i64, actor: i64) -> Result<()> {
+    let orders: Vec<i64> = sqlx::query_scalar("SELECT id FROM orders WHERE checkout_id=?")
+        .bind(id)
+        .fetch_all(&mut **tx)
+        .await?;
+    for order in orders {
+        restore(tx, order, actor).await?;
+    }
+    sqlx::query("UPDATE orders SET status='cancelled',actor_id=? WHERE checkout_id=?")
+        .bind(actor)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE checkouts SET payment='cancelled' WHERE id=?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn expire_unpaid_checkouts(app: App) {
+    loop {
+        let result = expired_checkouts(&app).await;
+        let delay = match result {
+            Ok(50) => 1,
+            Ok(_) => 60,
+            Err(error) => {
+                tracing::warn!(error = %error.1, "checkout expiry failed");
+                60
+            }
+        };
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+async fn expired_checkouts(app: &App) -> Result<usize> {
+    let candidates: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM checkouts WHERE payment='waiting' AND stock_reserved
+         AND created_at<=CURRENT_TIMESTAMP(6)-INTERVAL ? HOUR ORDER BY created_at,id LIMIT 50",
+    )
+    .bind(app.payment_hold_hours)
+    .fetch_all(&app.db)
+    .await?;
+    for id in &candidates {
+        // Recheck each checkout under the same lock used by payment and manual cancellation.
+        if let Err(error) = expire_checkout(app, *id).await {
+            tracing::warn!(checkout_id = id, status = %error.0, "could not expire checkout");
+        }
+    }
+    Ok(candidates.len())
+}
+
+pub(super) async fn expire_checkout(app: &App, id: i64) -> Result<()> {
+    let mut tx = app.db.begin().await?;
+    let buyer: Option<i64> = sqlx::query_scalar(
+        "SELECT user_id FROM checkouts WHERE id=? AND payment='waiting' AND stock_reserved
+         AND created_at<=CURRENT_TIMESTAMP(6)-INTERVAL ? HOUR FOR UPDATE",
+    )
+    .bind(id)
+    .bind(app.payment_hold_hours)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(buyer) = buyer {
+        let actor: i64 = sqlx::query_scalar(
+            "SELECT id FROM users WHERE email='checkout-expiry@system.tosca.invalid' AND suspended AND NOT admin",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        cancel_unpaid(&mut tx, id, actor).await?;
+        notice(
+            &mut tx,
+            buyer,
+            "An unpaid checkout expired and was cancelled.",
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn restore(tx: &mut Transaction<'_, MySql>, order: i64, actor: i64) -> Result<()> {
-    sqlx::query("UPDATE variants v JOIN order_lines l ON l.variant_id=v.id SET v.stock=v.stock+l.quantity,v.actor_id=? WHERE l.order_id=?").bind(actor).bind(order).execute(&mut **tx).await?;
+    sqlx::query("UPDATE variants v JOIN order_lines l ON l.variant_id=v.id
+                JOIN orders o ON o.id=l.order_id JOIN checkouts c ON c.id=o.checkout_id
+                SET v.stock=v.stock+l.quantity,v.actor_id=? WHERE l.order_id=? AND c.stock_reserved")
+        .bind(actor).bind(order).execute(&mut **tx).await?;
     Ok(())
 }
 async fn pay(State(app): State<App>, user: User, Path(id): Path<i64>) -> Result {
     user.admin()?;
     let mut tx = app.db.begin().await?;
-    let (status, buyer): (String, i64) =
-        sqlx::query_as("SELECT payment,user_id FROM checkouts WHERE id=? FOR UPDATE")
+    let (status, buyer, expired): (String, i64, bool) =
+        sqlx::query_as("SELECT payment,user_id,(stock_reserved AND created_at<=CURRENT_TIMESTAMP(6)-INTERVAL ? HOUR) FROM checkouts WHERE id=? FOR UPDATE")
+            .bind(app.payment_hold_hours)
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
@@ -501,6 +642,9 @@ async fn pay(State(app): State<App>, user: User, Path(id): Path<i64>) -> Result 
     }
     if status != "waiting" {
         return Err(Error::conflict("Checkout cannot be marked paid"));
+    }
+    if expired {
+        return Err(Error::conflict("This unpaid checkout expired"));
     }
     sqlx::query("UPDATE checkouts SET payment='paid',paid_by=? WHERE id=?")
         .bind(user.id)
@@ -553,6 +697,7 @@ async fn return_media(
     user: User,
     Path(name): Path<String>,
     Query(options): Query<ReturnMediaOptions>,
+    request: Request,
 ) -> Result<Response> {
     let (_, mime) = catalog::return_media_name(&name).ok_or_else(Error::missing)?;
     let path = format!("{}{name}", catalog::RETURN_MEDIA_PREFIX);
@@ -561,18 +706,17 @@ async fn return_media(
     if !allowed {
         return Err(Error::missing());
     }
-    let bytes = uploads::read_private(&name, options.size)
-        .await
-        .map_err(|_| Error::missing())?;
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, mime),
-            (axum::http::header::CACHE_CONTROL, "private, no-store"),
-            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        bytes,
-    )
-        .into_response())
+    let mut response = uploads::serve_private(&name, options.size, request).await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(Error::missing());
+    }
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, http::HeaderValue::from_static(mime));
+    headers.insert(
+        CACHE_CONTROL,
+        http::HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
 }
 async fn request_return(
     State(app): State<App>,

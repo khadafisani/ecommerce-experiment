@@ -47,8 +47,9 @@ Copy-Item .env.example .env
 
 Edit `backend/.env` before starting the API.
 
-- Set `DATABASE_URL` to your MariaDB connection URL, for example `mysql://root:YOUR_PASSWORD@127.0.0.1:3306/tosca_market`. Percent-encode reserved characters in the password. The database user needs permission to create the named database if it is missing and to apply migrations.
+- Set `DATABASE_URL` to your MariaDB connection URL, for example `mysql://root:YOUR_PASSWORD@127.0.0.1:3306/tosca_market`. Percent-encode reserved characters in the password. The database user needs permission to create the named database if it is missing and to apply migrations. Remote MariaDB connections require `ssl-mode=VERIFY_IDENTITY` and a trusted server certificate.
 - Set `JWT_SECRET` to a randomly generated value of at least 32 bytes. Run `[guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')` in PowerShell and paste the result into `.env`.
+- Set `APP_URL` to the exact storefront origin, including any port. Outside loopback development it must use HTTPS. Browser writes are checked against this origin and JWTs use HttpOnly cookies.
 - Keep `MEILI_URL=http://127.0.0.1:7700` for the loopback setup above. Leave `MEILI_KEY` blank when Meilisearch runs without authentication. For a keyed instance, use a key that can manage indexes and search them.
 - To seed an administrator, set both `ADMIN_EMAIL` and `ADMIN_PASSWORD`. For a sample storefront, set `DEMO_CATALOG=true`. Set `MANUAL_PAYMENT_INSTRUCTIONS` if you want custom instructions shown to buyers after ordering.
 
@@ -60,13 +61,13 @@ In a new terminal at the project root, run the following commands.
 
 ```powershell
 cd frontend
-bun install
+bun install --frozen-lockfile
 bun run dev --host 127.0.0.1
 ```
 
 Open the [development storefront](http://127.0.0.1:5173). Vite forwards API and upload requests to port `8080`.
 
-To serve a built storefront through Axum, run `bun run build` from `frontend/` and open [the backend URL](http://127.0.0.1:8080). If you use this URL for password recovery, set `APP_URL=http://127.0.0.1:8080` in `backend/.env` and restart the API.
+To serve a built storefront through Axum, run `bun run build` from `frontend/`, set `APP_URL=http://127.0.0.1:8080` in `backend/.env`, restart the API, and open [the backend URL](http://127.0.0.1:8080).
 
 ## Seed the local test marketplace
 
@@ -80,7 +81,7 @@ If the API is already running on Windows, use `cargo run --target-dir target/see
 
 The seed adds 24 shops, 768 products, 2,304 variants, 240 buyers, 48 shop employees, and 10,000 checkouts. Purchase dates span about four years, with more activity in recent months. Seeded listings display product initials in place of fixture photos. The original checkout scenarios, tracking, reviews, returns, notifications, and moderation queues are included. An existing 1,800-checkout seed receives 8,200 additional checkouts. Reruns reuse the same two batches and ask Meilisearch to refresh its indexes.
 
-All active fixture accounts use `ToscaTest2026!` on the local development database.
+Set `ALLOW_TEST_ACCOUNTS=true` only on the isolated local development backend to sign in to fixture accounts with `ToscaTest2026!`. Fixture sign-in and existing fixture sessions are disabled by default.
 
 | Sign in | Email | What to test |
 | --- | --- | --- |
@@ -108,8 +109,11 @@ For performance comparisons, run each backend with `cargo run --release` and use
 ## Workspaces
 
 - Customer sign-in and registration live at `/login` and `/register`. Guest orders are accessible from the browser that placed them while its guest session is valid.
+- When updating from the previous browser-storage session format, registered users sign in again. A valid existing guest session can move to the cookie format on the same browser.
 - Merchant sign-in and registration live at `/merchant/login` and `/merchant/register`. Existing customers can open a shop at `/merchant`. In the merchant workspace, owners use **Team** to create employee accounts, deactivate or reactivate shop access, and reset passwords for accounts dedicated to their shop. A password reset revokes the employee's existing sessions.
 - Admin sign-in lives at `/admin/login`. Admins approve taxonomy and products, manage users and shops, moderate reviews, configure couriers, and confirm manual payments under **Manual payments**.
+- Unpaid checkouts reserve stock for 24 hours by default. Set `PAYMENT_HOLD_HOURS` from 1 to 720 to match your manual payment window. Expired unpaid checkouts are cancelled and their stock is returned automatically.
+- Each upload is limited to 10 MiB. Before upload, the browser resizes images larger than that to at most 1,440 pixels on their longest side. The server still generates its responsive image sizes. MP4 and WebM files must already fit within 10 MiB.
 - Shipping is Rp 1,000 per kg, calculated separately for each shop. Tax defaults to zero for development and can be configured in basis points. Merchants enter tracking details manually. QRIS and bank logos are disabled placeholders for future gateway integration.
 - For password recovery, configure `SMTP_URL`, `SMTP_FROM`, and `APP_URL`. Each search runs two concurrent Meilisearch requests, one per index. Products match by name, brand, and category. Shops match by name. The API returns up to six products (`items`) with `id`, `name`, and `lowest_price`, and up to four shops (`shops`) with `id` and `name`. Full results and autocomplete show the groups separately, with products first. The index definitions live in `backend/src/search/products.rs` and `backend/src/search/shops.rs`. The worker applies the settings to existing indexes and syncs committed catalog changes from MariaDB through a durable queue. Search visibility updates asynchronously and the API returns HTTP 503 while Meilisearch is unavailable.
 
