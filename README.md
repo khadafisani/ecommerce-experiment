@@ -133,6 +133,8 @@ To use a new `MEILI_INDEX_SUFFIX`, stop the backend that serves that database, u
 
 The background worker continues syncing catalog changes and recreates a missing index while the backend is running. Give each database a distinct suffix if they share a Meilisearch server. Use the same suffix for all running backends that share one database and its sync queue.
 
+Admin product searches use the existing storefront product index for words and phrases. MariaDB supplies moderation-only listings and shop-name matches. For broad queries the API tries a time-limited catalog-wide chronological search in MariaDB. If that does not fill the page in time, the API orders the indexed matches by date.
+
 Run `cargo check` from `backend/` and `bun run check` from `frontend/` for development validation.
 
 Demo photos are from [Unsplash](https://unsplash.com/). Checkout assets come from Wikimedia Commons. [QRIS](https://commons.wikimedia.org/wiki/File:Logo_QRIS.svg), [BCA](https://commons.wikimedia.org/wiki/File:Bank_Central_Asia.svg), [BRI](https://commons.wikimedia.org/wiki/File:BRI_2025.svg), [Mandiri](https://commons.wikimedia.org/wiki/File:Bank_Mandiri_logo_2016.svg).

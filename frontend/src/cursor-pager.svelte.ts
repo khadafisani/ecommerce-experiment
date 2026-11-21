@@ -3,7 +3,7 @@ import { message } from './api';
 type CursorPage<T, C> = { items: T[]; cursor: C | null };
 type FetchPage<T, C> = (cursor: C | null) => Promise<CursorPage<T, C>>;
 
-export class CursorPager<T extends { id: number }, C extends number | string = number> {
+export class CursorPager<T extends { id: number | string }, C extends number | string = number> {
   items = $state.raw<T[]>([]);
   cursor = $state<C | null>(null);
   loading = $state(false);

@@ -6,6 +6,7 @@
   import CursorMore from './CursorMore.svelte';
   import Chart from './Chart.svelte';
   import ProductInitials from './ProductInitials.svelte';
+  import RecordHistory from './RecordHistory.svelte';
   import ResponsiveImage from './ResponsiveImage.svelte';
   import Fields, {type Field} from './Fields.svelte';
   let {portal,parts,account}: {portal:string;parts:string[];account:Row}=$props();
@@ -16,47 +17,74 @@
   let base=$derived(admin?'/admin':'/merchant/'+activeShop?.id);
   let error=$state(''), feedback=$state(''), pending=$state(false), loading=$state(true);
   let data=$state<Row>({}), rows=$state<Row[]>([]), couriers=$state<Row[]>([]), terms=$state<Row[]>([]);
+  let historyRevision=$state(0);
   let editor=$state<{ title:string;fields:Field[];action:(data:Row)=>Promise<void> }|null>(null);
   let status=$state(''), sort=$state(''), duration=$state('day'), q=$state(''), shopFilter=$state(''), userFilter=$state('');
   let lineQuery=$state('');
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  let loadController: AbortController | undefined;
+  const searchDelay = 250;
   const pager = new CursorPager<Row & {id:number}>();
   let paged = $derived(!admin && !record && (section==='products'||section==='orders'));
   const adminSections=['dashboard','products','taxonomy','reviews','users','shops','couriers','payments'];
   const shopSections=['dashboard','products','orders','team'];
   const navigation:Record<string,string>={dashboard:'Overview',products:'Products',taxonomy:'Brands & categories',reviews:'Reviews',users:'Users',shops:'Shops',couriers:'Couriers',payments:'Manual payments',orders:'Orders',team:'Team'};
+  const recordNames:Record<string,string>={products:'Product',taxonomy:'Taxonomy term',reviews:'Review',users:'User',shops:'Shop',couriers:'Courier',payments:'Checkout',orders:'Order',team:'Team member'};
+  let adminRecord=$derived(admin && record && section!=='dashboard' && adminSections.includes(section));
+  let historyPath=$derived(base+'/'+section+'/'+record+'/history');
   const navIcons:Record<string,typeof Store>={dashboard:LayoutDashboard,products:Boxes,orders:ClipboardList,users:Users,team:Users,payments:Wallet};
   const statuses=['waiting_payment','waiting_shop','packing','delivery','completed','rejected','return_review','return_accepted','return_rejected','return_completed','cancelled'];
   const productStatuses=['pending','active','inactive','rejected'];
-  let statusesForSection=$derived(section==='products'&&!record?productStatuses:section==='taxonomy'?['pending','approved','rejected']:section==='payments'?['waiting','paid','cancelled']:!admin&&(section==='dashboard'||section==='orders')?statuses:[]);
+  let statusesForSection=$derived(section==='products'&&!record?productStatuses:section==='taxonomy'?['pending','approved','rejected']:section==='payments'?['waiting','paid','cancelled']:section==='reviews'?['hidden']:!admin&&(section==='dashboard'||section==='orders')?statuses:[]);
   const shopKey=key();
-  onMount(()=>{if(!admin&&section==='products'&&record&&record!=='new')duration='week';void load();});
+  onMount(()=>{
+    if(!admin&&section==='products'&&record&&record!=='new')duration='week';
+    void load();
+    return ()=>{
+      clearTimeout(searchTimer);
+      loadController?.abort();
+    };
+  });
+  function queueSearch(event: Event & { currentTarget: HTMLInputElement }) {
+    clearTimeout(searchTimer);
+    if (event instanceof InputEvent && event.isComposing) return;
+    if (event.currentTarget.form?.matches(':invalid')) return;
+    searchTimer = setTimeout(() => void load(), searchDelay);
+  }
   async function load() {
+    clearTimeout(searchTimer);
+    loadController?.abort();
     if(!admin&&!activeShop||admin&&!account.user.admin){loading=false;return;}
+    const controller = new AbortController();
+    loadController = controller;
+    const get = <T = Row>(path: string) => api<T>(path, 'GET', undefined, true, controller.signal);
     if(paged) {
       const route=base+'/'+section;
       const filters={q,status};
       loading=false;error='';
-      await pager.reset(cursor=>api(route+params({...filters,cursor})));
+      await pager.reset(cursor=>get(route+params({...filters,cursor})));
       return;
     }
     loading=true;error='';
     try{
-      if(section==='dashboard') data=await api(base+'/dashboard'+params(admin?{status:duration,q,sort}:{status,sort:duration}));
+      if(adminRecord) return;
+      if(section==='dashboard') data=await get(base+'/dashboard'+params(admin?{status:duration,q,sort}:{status,sort:duration}));
       else if(!admin&&record&&record!=='new') {
-        data=await api(base+'/'+section+'/'+record+params({status:section==='products'?duration:null,sort}));
-        if(section==='orders') couriers=await api<Row[]>('/couriers');
-      } else if(!admin&&record==='new') terms=await api<Row[]>('/categories');
+        data=await get(base+'/'+section+'/'+record+params({status:section==='products'?duration:null,sort}));
+        if(section==='orders') couriers=await get<Row[]>('/couriers');
+      } else if(!admin&&record==='new') terms=await get<Row[]>('/categories');
       else {
-        rows=await api<Row[]>(base+'/'+section+params({q,status,sort,shop:shopFilter,category:userFilter}));
+        rows=await get<Row[]>(base+'/'+section+params({q,status,sort,shop:shopFilter,category:userFilter}));
       }
-    }catch(e){error=message(e);}finally{loading=false;}
+    }catch(e){if(!controller.signal.aborted)error=message(e);}
+    finally{if(!controller.signal.aborted)loading=false;}
   }
   async function perform(path:string,method='POST',body?:Row) {
     if(pending)return;pending=true;error='';feedback='';
-    try{await api(path,method,body);feedback='Saved.';await load();}catch(e){error=message(e);}finally{pending=false;}
+    try{await api(path,method,body);historyRevision++;feedback='Saved.';await load();}catch(e){error=message(e);}finally{pending=false;}
   }
   function form(title:string,fields:Field[],submit:(data:Row)=>Promise<unknown>,success?:string) {
-    editor={title,fields,action:async(data)=>{await submit(data);editor=null;if(success)location.assign(success);else {feedback='Saved.';await load();}}};
+    editor={title,fields,action:async(data)=>{await submit(data);editor=null;if(success)location.assign(success);else {historyRevision++;feedback='Saved.';await load();}}};
   }
   const name=(value?:string):Field=>({name:'name',label:'Name',value});
   const note=(label='Note'):Field=>({name:'note',label,type:'textarea'});
@@ -118,13 +146,35 @@
   function orderStatus(status:string) {void perform(base+'/orders/'+record,'POST',{status});}
 </script>
 
+{#snippet productActions(row:Row)}
+  {#if row.status==='pending'}<button disabled={pending} onclick={()=>moderate(row,'active')}>Approve</button><button disabled={pending} onclick={()=>moderate(row,'rejected')}>Reject</button>{/if}
+  {#if row.status==='active'}<button disabled={pending} onclick={()=>moderate(row,'inactive')}>Make inactive</button>{/if}
+{/snippet}
+{#snippet taxonomyActions(row:Row)}
+  {#if row.status!=='approved'}<button disabled={pending} onclick={()=>perform('/admin/taxonomy/'+row.id,'PUT',{status:'approved'})}>Approve</button>{/if}
+  {#if row.status==='pending'}<button disabled={pending} onclick={()=>perform('/admin/taxonomy/'+row.id,'PUT',{status:'rejected'})}>Reject</button><button onclick={()=>editTaxonomy(row)}>Replace</button>{/if}
+{/snippet}
+{#snippet otherActions(row:Row)}
+  {#if section==='team'&&row.role==='Employee'}
+    <button disabled={pending} onclick={()=>setEmployeeAccess(row)}>{row.active?'Deactivate access':'Reactivate access'}</button>
+    {#if row.can_reset_password}<button disabled={pending} onclick={()=>resetEmployeePassword(row)}>Reset password</button>{/if}
+  {/if}
+  {#if section==='users'||section==='shops'}<button disabled={pending} onclick={()=>perform(base+'/'+section+'/'+row.id,'PUT',{suspended:!row.suspended})}>{row.suspended?'Restore':'Suspend'}</button>{/if}
+  {#if section==='users'}<button onclick={()=>form('Change password',[{name:'password',label:'New password',type:'password'}],input=>api(base+'/users/'+row.id,'PUT',input))}>Change password</button>{/if}
+  {#if section==='reviews'&&!row.deleted}<button disabled={pending} onclick={()=>{if(confirm('Hide this review from the marketplace?'))perform(base+'/reviews/'+row.id,'PUT');}}>Hide review</button>{/if}
+  {#if section==='couriers'&&row.id!==1}<button onclick={()=>courierEditor(row)}>Edit</button>{/if}
+  {#if section==='payments'}<a href={'/orders/'+row.id}>View checkout</a>{#if row.payment==='waiting'}<button disabled={pending} onclick={()=>{if(confirm('Confirm that manual payment has been received?'))perform('/checkout/'+row.id+'/pay');}}>Mark paid</button>{/if}{/if}
+{/snippet}
+{#snippet adminActions(row:Row)}
+  {#if section==='products'}{@render productActions(row)}
+  {:else if section==='taxonomy'}{@render taxonomyActions(row)}
+  {:else}{@render otherActions(row)}{/if}
+{/snippet}
 {#snippet productRows(list:Row[])}
   <div class="table-scroll"><table><thead><tr><th>Product</th><th>{admin?'Shop':'Lowest price'}</th><th>{admin?'Taxonomy':'Sold / Stock'}</th><th>Status</th><th>{admin?'Created':'Last updated by'}</th><th>Actions</th></tr></thead><tbody>
   {#each list as row (row.id)}<tr><td><div class="table-item">{#if row.image}<ResponsiveImage src={row.image} alt="" sizes="40px" uploadSize="thumbnail" />{:else}<ProductInitials name={row.name}/>{/if}<div><strong>{row.name}</strong>{#if admin}<small>{row.description}</small>{/if}{#if row.note}<small>{row.note}</small>{/if}</div></div></td><td>{admin?row.shop:money(row.lowest_price)}</td><td>{admin?[row.brand,row.category].filter(Boolean).join(' / ')||'—':row.sold+' / '+row.stock+(Number(row.stock)===0?' · Out of stock':'')}</td><td><span class="badge">{label(row.status)}</span></td><td>{admin?date(row.created_at):row.actor}</td><td class="row-actions">
-    {#if admin}
-      {#if row.status==='pending'}<button disabled={pending} onclick={()=>moderate(row,'active')}>Approve</button><button disabled={pending} onclick={()=>moderate(row,'rejected')}>Reject</button>{/if}
-      {#if row.status==='active'}<button disabled={pending} onclick={()=>moderate(row,'inactive')}>Make inactive</button>{/if}
-    {:else}<a href={base+'/products/'+row.id}>Details <ArrowRight size={15}/></a>{/if}
+    <a href={base+'/products/'+row.id}>Details <ArrowRight size={15}/></a>
+    {#if admin}{@render productActions(row)}{/if}
   </td></tr>{:else}<tr><td colspan="6">No matching products.</td></tr>{/each}
   </tbody></table></div>
 {/snippet}
@@ -137,17 +187,17 @@
 {#snippet taxonomyRows(list:Row[])}
   <div class="table-scroll"><table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead><tbody>
     {#each list as row (row.id)}<tr><td>{row.name}</td><td>{label(row.kind)}</td><td><span class="badge">{label(row.status)}</span></td><td>{date(row.created_at)}</td><td class="row-actions">
-      {#if row.status!=='approved'}<button disabled={pending} onclick={()=>perform('/admin/taxonomy/'+row.id,'PUT',{status:'approved'})}>Approve</button>{/if}
-      {#if row.status==='pending'}<button disabled={pending} onclick={()=>perform('/admin/taxonomy/'+row.id,'PUT',{status:'rejected'})}>Reject</button><button onclick={()=>editTaxonomy(row)}>Replace</button>{/if}
+      <a href={'/admin/taxonomy/'+row.id}>Details <ArrowRight size={15}/></a>
+      {@render taxonomyActions(row)}
     </td></tr>{:else}<tr><td colspan="5">No matching terms.</td></tr>{/each}
   </tbody></table></div>
 {/snippet}
 {#snippet filter(searchable:boolean,sortOptions=false)}
   <form class="filter" onsubmit={(e)=>{e.preventDefault();load();}}>
-    {#if searchable}<input aria-label="Search records" placeholder="Search records" bind:value={q}>{/if}
-    {#if statusesForSection.length}<select aria-label="Filter by status" bind:value={status} onchange={()=>load()}><option value="">All statuses</option>{#each statusesForSection as value (value)}<option value={value}>{label(value)}</option>{/each}</select>{/if}
+    {#if searchable}<input aria-label="Search records" placeholder="Search records" bind:value={q} oninput={queueSearch} oncompositionend={queueSearch}>{/if}
+    {#if statusesForSection.length}<select aria-label="Filter by status" bind:value={status} onchange={()=>load()}><option value="">{section==='reviews'?'Visible':'All statuses'}</option>{#each statusesForSection as value (value)}<option value={value}>{label(value)}</option>{/each}</select>{/if}
     {#if sortOptions}<select aria-label="Sort by date" bind:value={sort} onchange={()=>load()}><option value="">{section==='dashboard'&&admin?'Oldest first':'Newest first'}</option><option value={section==='dashboard'&&admin?'newest':'oldest'}>{section==='dashboard'&&admin?'Newest first':'Oldest first'}</option></select>{/if}
-    {#if section==='reviews'}<input aria-label="Shop ID" placeholder="Shop ID" inputmode="numeric" bind:value={shopFilter}><input type="email" aria-label="Reviewer email" placeholder="Reviewer email" bind:value={userFilter}>{/if}
+    {#if section==='reviews'}<input aria-label="Shop ID" placeholder="Shop ID" inputmode="numeric" bind:value={shopFilter} oninput={queueSearch} oncompositionend={queueSearch}><input type="email" aria-label="Reviewer email" placeholder="Reviewer email" bind:value={userFilter} oninput={queueSearch} oncompositionend={queueSearch}>{/if}
     {#if searchable}<button>Search</button>{/if}
   </form>
 {/snippet}
@@ -174,19 +224,30 @@
     <a class="breadcrumb" href="/"><ArrowLeft size={15}/> Marketplace</a>
   </aside>
   <div class="workspace">
-    <div class="section-head"><h1>{record==='new'?'New product':record?(data.name??(section==='orders'?'Order #'+record:navigation[section])):navigation[section]}</h1>
+    {#if record}<a class="breadcrumb" href={base+'/'+section}><ArrowLeft size={15}/> {navigation[section]}</a>{/if}
+    <div class="section-head"><h1>{record==='new'&&!admin?'New product':record?(data.name??recordNames[section]+' #'+record):navigation[section]}</h1>
+    {#if adminRecord || (record && data.id && ['products','orders','team'].includes(section))}<a class="button" href="#record-history">View history</a>{/if}
     {#if !admin&&section==='products'&&!record}<a class="primary" href={base+'/products/new'}><Plus size={17}/> New product</a>{/if}
-    {#if admin&&section==='users'}<button class="primary" onclick={()=>form('Create administrator',accountFields,data=>api('/admin/accounts','POST',data))}><Plus size={17}/> Add admin</button>{/if}
-    {#if !admin&&section==='team'&&activeShop?.owner}<button class="primary" onclick={()=>form('Create employee account',accountFields,data=>api(base+'/team','POST',data))}><Plus size={17}/> Add employee</button>{/if}
-    {#if admin&&section==='couriers'}<button class="primary" onclick={()=>courierEditor()}><Plus size={17}/> Add courier</button>{/if}
-    {#if admin&&section==='taxonomy'}<button class="primary" onclick={()=>form('Add approved term',[name(),{name:'kind',label:'Type',options:[{value:'brand',text:'Brand'},{value:'category',text:'Category'}]}],data=>api('/admin/taxonomy','POST',data))}><Plus size={17}/> Add term</button>{/if}
+    {#if !record&&admin&&section==='users'}<button class="primary" onclick={()=>form('Create administrator',accountFields,data=>api('/admin/accounts','POST',data))}><Plus size={17}/> Add admin</button>{/if}
+    {#if !record&&!admin&&section==='team'&&activeShop?.owner}<button class="primary" onclick={()=>form('Create employee account',accountFields,data=>api(base+'/team','POST',data))}><Plus size={17}/> Add employee</button>{/if}
+    {#if !record&&admin&&section==='couriers'}<button class="primary" onclick={()=>courierEditor()}><Plus size={17}/> Add courier</button>{/if}
+    {#if !record&&admin&&section==='taxonomy'}<button class="primary" onclick={()=>form('Add approved term',[name(),{name:'kind',label:'Type',options:[{value:'brand',text:'Brand'},{value:'category',text:'Category'}]}],data=>api('/admin/taxonomy','POST',data))}><Plus size={17}/> Add term</button>{/if}
     </div>
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#if feedback}<p class="feedback" role="status">{feedback}</p>{/if}
     {#if paged&&pager.cursor===null&&pager.error}<p class="error" role="alert">{pager.error} <button onclick={()=>load()}>Retry</button></p>{/if}
     {#if (loading&&!Object.keys(data).length&&!rows.length) || (paged&&pager.loading&&!pager.items.length)}<p class="inline-empty">Loading…</p>{/if}
 
-    {#if section==='dashboard'}
+    {#if adminRecord}
+      <RecordHistory path={historyPath} title={recordNames[section]+' history'} revision={historyRevision} actions={adminActions} anchor="record-history"/>
+      {#if section==='products'}
+        <RecordHistory path={historyPath} title="Variant history" kind="variants" revision={historyRevision}/>
+        <RecordHistory path={historyPath} title="Review history" kind="reviews" revision={historyRevision}/>
+      {:else if section==='payments'}
+        <RecordHistory path={historyPath} title="Order history" kind="orders" revision={historyRevision}/>
+        <RecordHistory path={historyPath} title="Return history" kind="returns" revision={historyRevision}/>
+      {/if}
+    {:else if section==='dashboard'}
       {@render periods(admin?['day','week','month','year']:['day','month','year'])}
       <div class="detail-grid chart-grid"><Chart title="Sales" points={data.sales??[]} currency/>{#if admin}<Chart title="Unique signed-in users" points={data.users??[]}/>{:else}<Chart title="Product stock health" points={data.stock??[]} pie/>{/if}</div>
       <section class="panel section"><h2>{admin?'Moderation queue':'Recent orders'}</h2>{@render filter(admin,admin)}{#if admin}<h3>Products awaiting review</h3>{@render productRows(data.products??[])}<h3 class="section">Brands & categories awaiting review</h3>{@render taxonomyRows(data.taxonomy??[])}{:else}{@render orderRows(data.orders??[])}{/if}</section>
@@ -206,6 +267,9 @@
       <div class="section">{@render periods(['week','month','year'])}<Chart title="Units sold" points={data.series}/></div>
       <section class="panel section"><h2>Related orders</h2>{@render filter(false,true)}{@render orderRows(data.orders)}</section>
       <section class="panel section"><h2>Reviews</h2>{#each data.reviews as review (review.id)}<article class="review"><strong>{review.user} · {review.rating}/5</strong><p>{review.body}</p>{#if review.reply}<blockquote>{review.reply}</blockquote>{/if}<button onclick={()=>form('Reply to review',[{name:'body',label:'Reply',type:'textarea',value:review.reply}],input=>api(base+'/reviews/'+review.id,'PUT',input))}>Reply</button></article>{:else}<p>No reviews yet.</p>{/each}</section>
+      <RecordHistory path={historyPath} title="Product history" revision={historyRevision} anchor="record-history"/>
+      <RecordHistory path={historyPath} title="Variant history" kind="variants" revision={historyRevision}/>
+      <RecordHistory path={historyPath} title="Review history" kind="reviews" revision={historyRevision}/>
     {:else if section==='products'}
       <section class="panel">{@render filter(true,admin)}{@render productRows(paged?pager.items:rows)}</section>
     {:else if section==='orders'&&record&&data.id}
@@ -226,27 +290,29 @@
       <div class="table-scroll"><table><thead><tr><th>Item</th><th>Variant</th><th>Quantity</th><th>Unit price</th></tr></thead><tbody>
       {#each data.items.filter((item:Row)=>(item.product_name+' '+item.variant_name).toLowerCase().includes(lineQuery.toLowerCase())) as item,i (i)}<tr><td><a href={base+'/products/'+item.product_id}>{item.product_name}</a></td><td>{item.variant_name}</td><td>{item.quantity}</td><td>{money(item.price)}</td></tr>{:else}<tr><td colspan="4">No items match.</td></tr>{/each}
       </tbody></table></div></section>
+      <RecordHistory path={historyPath} title="Order history" revision={historyRevision} anchor="record-history"/>
+      <RecordHistory path={historyPath} title="Return history" kind="returns" revision={historyRevision}/>
     {:else if section==='orders'}
       <section class="panel">{@render filter(false)}{@render orderRows(pager.items)}</section>
     {:else if section==='taxonomy'&&admin}
       <section class="panel">{@render filter(true,true)}{@render taxonomyRows(rows)}</section>
+    {:else if section==='team'&&record}
+      {#if data.id}
+        <section class="panel">
+          <div class="split"><p>{data.email} · {data.role} · {data.suspended?'Suspended':data.active?'Active':'Inactive'}</p><div class="actions">{@render otherActions(data)}</div></div>
+        </section>
+        <RecordHistory path={historyPath} title="Team access history" revision={historyRevision} anchor="record-history"/>
+      {/if}
     {:else}
       <section class="panel">
         {#if admin}{@render filter(true,section==='reviews')}{/if}
         <div class="table-scroll"><table><thead><tr><th>Name</th><th>Details</th><th>Status</th><th>Actions</th></tr></thead><tbody>
           {#each rows as row (row.id)}<tr><td><strong>{row.name}</strong>{#if section==='couriers'&&row.logo}<ResponsiveImage class="table-logo" src={row.logo} alt="" sizes="36px" uploadSize="thumbnail" />{/if}</td>
           <td>{#if section==='payments'}<span class="id-cell">{row.checkout_no}</span><br>{money(row.total)} · {date(row.created_at)}{:else if section==='reviews'}{row.user} · {row.shop} · {date(row.created_at)}<br>{row.body}{:else}{row.email??row.owner??row.url??'—'}{/if}</td>
-          <td>{section==='reviews'?row.rating+'/5':section==='payments'?label(row.payment):(section==='team' ? row.role+' ? '+(row.suspended?'Suspended':row.active?'Active':'Inactive') : row.role)??(row.suspended?'Suspended':row.admin?'Administrator':section==='couriers'?'Available':'Active')}</td>
+          <td>{section==='reviews'?row.rating+'/5'+(row.deleted?' · Hidden':''):section==='payments'?label(row.payment):(section==='team' ? row.role+' · '+(row.suspended?'Suspended':row.active?'Active':'Inactive') : row.role)??(row.suspended?'Suspended':row.admin?'Administrator':section==='couriers'?'Available':'Active')}</td>
           <td class="row-actions">
-            {#if section==='team'&&row.role==='Employee'}
-              <button disabled={pending} onclick={()=>setEmployeeAccess(row)}>{row.active?'Deactivate access':'Reactivate access'}</button>
-              {#if row.can_reset_password}<button disabled={pending} onclick={()=>resetEmployeePassword(row)}>Reset password</button>{/if}
-            {/if}
-            {#if section==='users'||section==='shops'}<button disabled={pending} onclick={()=>perform(base+'/'+section+'/'+row.id,'PUT',{suspended:!row.suspended})}>{row.suspended?'Restore':'Suspend'}</button>{/if}
-            {#if section==='users'}<button onclick={()=>form('Change password',[{name:'password',label:'New password',type:'password'}],input=>api(base+'/users/'+row.id,'PUT',input))}>Change password</button>{/if}
-            {#if section==='reviews'}<button disabled={pending} onclick={()=>{if(confirm('Hide this review from the marketplace?'))perform(base+'/reviews/'+row.id,'PUT');}}>Hide review</button>{/if}
-            {#if section==='couriers'&&row.id!==1}<button onclick={()=>courierEditor(row)}>Edit</button>{/if}
-            {#if section==='payments'}<a href={'/orders/'+row.id}>View checkout</a>{#if row.payment==='waiting'}<button disabled={pending} onclick={()=>{if(confirm('Confirm that manual payment has been received?'))perform('/checkout/'+row.id+'/pay');}}>Mark paid</button>{/if}{/if}
+            <a href={base+'/'+section+'/'+row.id}>Details <ArrowRight size={15}/></a>
+            {@render otherActions(row)}
           </td></tr>{:else}<tr><td colspan="4">No matching records.</td></tr>{/each}
         </tbody></table></div>
       </section>

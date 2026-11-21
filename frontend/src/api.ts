@@ -58,21 +58,21 @@ async function renew() {
     }).finally(() => { refreshing = undefined; });
   return refreshing;
 }
-async function request(path: string, method = 'GET', body?: unknown, retry = true, keepalive = false): Promise<Response> {
+async function request(path: string, method = 'GET', body?: unknown, retry = true, keepalive = false, signal?: AbortSignal): Promise<Response> {
   const headers = new Headers();
   const token = storage.getItem('access');
   if (token && !path.startsWith('/auth/login') && !path.startsWith('/auth/register')) headers.set('Authorization', 'Bearer ' + token);
   if (body !== undefined && !(body instanceof FormData)) headers.set('Content-Type', 'application/json');
-  const response = await fetch('/api' + path, {method, headers, keepalive, body: body instanceof FormData ? body : body === undefined ? undefined : JSON.stringify(body)});
-  if (response.status === 401 && retry && !path.startsWith('/auth/login') && await renew()) return request(path, method, body, false, keepalive);
+  const response = await fetch('/api' + path, {method, headers, keepalive, signal, body: body instanceof FormData ? body : body === undefined ? undefined : JSON.stringify(body)});
+  if (response.status === 401 && retry && !path.startsWith('/auth/login') && await renew()) return request(path, method, body, false, keepalive, signal);
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error ?? 'Could not connect to Tosca Market');
   }
   return response;
 }
-export async function api<T = Row>(path: string, method = 'GET', body?: unknown, retry = true): Promise<T> {
-  return (await request(path, method, body, retry)).json() as Promise<T>;
+export async function api<T = Row>(path: string, method = 'GET', body?: unknown, retry = true, signal?: AbortSignal): Promise<T> {
+  return (await request(path, method, body, retry, false, signal)).json() as Promise<T>;
 }
 
 type GuestSignal = { product_id: number; kind: 'view' | 'cart'; at: number };
