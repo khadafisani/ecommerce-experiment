@@ -4,55 +4,79 @@ A compact Indonesian marketplace with a Svelte storefront and separate merchant 
 
 | Folder | Contents |
 | --- | --- |
-| `frontend/` | Svelte 5.58.0, Bun 1.4.4, Vite, UI assets, and Bun lockfile |
+| `frontend/` | Svelte 5.58.0, Bun 1.4.4, Vite, and UI assets |
 | `backend/` | Rust 1.100.0, Axum 0.8.9, MariaDB migrations, demo fixtures, and backend configuration |
 
 ## Run locally
 
-The backend uses the already-running MariaDB and Meilisearch services at `127.0.0.1:3306` and `127.0.0.1:7700` by default. Development credentials are `root/root` for MariaDB and no API key for Meilisearch. The application creates the named database if needed and applies migrations on startup.
+### 1. Install the prerequisites
 
-1. From `backend/`, copy `.env.example` to `.env`. Set `JWT_SECRET` to a randomly generated value of at least 32 bytes. In PowerShell, `[guid]::NewGuid().ToString() + [guid]::NewGuid().ToString()` produces a value for local development.
-2. Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` to seed the initial administrator. Set `DEMO_CATALOG=true` for a sample storefront. Set `MANUAL_PAYMENT_INSTRUCTIONS` to the instructions buyers should see after ordering.
-3. In `backend/`, run `cargo run`.
-4. In a second terminal, run `bun install` and `bun run dev` from `frontend/`. Open [the development storefront](http://127.0.0.1:5173). Alternatively, `bun run build` produces the frontend that Axum serves at [127.0.0.1:8080](http://127.0.0.1:8080).
+| Dependency | Download and setup |
+| --- | --- |
+| Git | Install Git if you need to clone the repository. [Git downloads](https://git-scm.com/downloads/) |
+| Rust 1.100.0 | Install with `rustup`. The backend pins the toolchain in [`rust-toolchain.toml`](backend/rust-toolchain.toml). On Windows, install the Visual Studio C++ Build Tools if prompted by the installer. [Install Rust](https://rust-lang.org/tools/install/) |
+| Bun 1.4.4 | Use Bun to install frontend dependencies and run Vite. [Bun downloads](https://bun.com/), [v1.4.4 release](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.4) |
+| MariaDB 12.3.4 | Choose the server package for your platform. On Windows, the MSI can install MariaDB as a service. Set a root password and enable TCP/IP on port `3306` during setup. [Download MariaDB](https://mariadb.org/download/?t=mariadb&p=mariadb&r=12.3.4) |
+| Meilisearch 1.57.0 | Download the binary for your OS and architecture from the release assets. For Windows x64, use `meilisearch-windows-amd64.exe`. [Meilisearch release](https://github.com/meilisearch/meilisearch/releases#release-v1.57.0) |
 
-## Import the Amazon catalog for load testing
-
-Put `amazon_products.csv` and `amazon_categories.csv` in the repository root. From the root, run the PowerShell script to import into local MariaDB database `tosca_market_amazon` with Meilisearch index suffix `_amazon`. If your local credentials differ from the development defaults, pass `-DatabaseUrl` with the correct connection URL. Use a distinct `-IndexSuffix` if you choose a different database.
-
-```powershell
-.\backend\import-amazon.ps1
-```
-
-The importer creates one benchmark shop and an active listing with a standard variant for each CSV row. It commits at most 5,000 products, their variants, and their search jobs in one transaction. Rerun the same command after an interruption to resume from the last commit and finish syncing Meilisearch. Use `-Limit 10000` to load up to 10,000 products total, then omit the limit to finish. Keep the source CSV files unchanged between runs.
-
-Prices use a fixed benchmark conversion of Rp16,000 per USD. A missing sale price uses the list price when available. Rows with neither price use a Rp10,000 placeholder and zero stock. Other variants have fixture stock of 30 and a weight of 500 g. Product names use the schema's 180-character limit, with the complete title kept in the description when shortened. Images are blank so the storefront shows product initials.
-
-After the import reports success, start the benchmark API from `backend/` with the same database and search indexes.
+To clone the repository and enter the project root, run the following commands.
 
 ```powershell
-$env:DATABASE_URL = 'mysql://root:root@127.0.0.1:3306/tosca_market_amazon'
-$env:MEILI_INDEX_SUFFIX = '_amazon'
-$env:SEMANTIC_SEARCH_ENABLED = 'false'
-$env:RECOMMENDATIONS_ENABLED = 'false'
-$env:DEMO_CATALOG = 'false'
-$env:BIND = '127.0.0.1:8086'
-cargo run --release --locked
+git clone https://github.com/khadafisani/ecommerce-experiment.git
+cd ecommerce-experiment
 ```
 
-If `frontend/dist` has been built, the backend serves the storefront at http://127.0.0.1:8086. For the search stress harness, use `http://127.0.0.1:8086/api/search`. With recommendations enabled, the app refreshes Stoolap from MariaDB on its normal schedule.
+### 2. Start MariaDB and Meilisearch
 
-Source: Asaniczka, [Amazon Products Dataset 2023 (1.4M Products)](https://doi.org/10.34740/kaggle/ds/3798081), [Open Data Commons Attribution License](https://opendatacommons.org/licenses/by/1-0/).
+Start the MariaDB service and make sure it accepts connections on `127.0.0.1:3306`. In a separate terminal, run Meilisearch from the folder containing the downloaded binary. This PowerShell example binds it to the loopback address.
 
-## Seed the test marketplace
+```powershell
+.\meilisearch-windows-amd64.exe --env development --http-addr 127.0.0.1:7700
+```
+
+Keep Meilisearch running and check [its health endpoint](http://127.0.0.1:7700/health) for `{"status":"available"}`.
+
+### 3. Configure and start the backend
+
+From the project root, create `backend/.env` from the example if you have not configured it yet.
+
+```powershell
+cd backend
+Copy-Item .env.example .env
+```
+
+Edit `backend/.env` before starting the API.
+
+- Set `DATABASE_URL` to your MariaDB connection URL, for example `mysql://root:YOUR_PASSWORD@127.0.0.1:3306/tosca_market`. Percent-encode reserved characters in the password. The database user needs permission to create the named database if it is missing and to apply migrations.
+- Set `JWT_SECRET` to a randomly generated value of at least 32 bytes. Run `[guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')` in PowerShell and paste the result into `.env`.
+- Keep `MEILI_URL=http://127.0.0.1:7700` for the loopback setup above. Leave `MEILI_KEY` blank when Meilisearch runs without authentication. For a keyed instance, use a key that can manage indexes and search them.
+- To seed an administrator, set both `ADMIN_EMAIL` and `ADMIN_PASSWORD`. For a sample storefront, set `DEMO_CATALOG=true`. Set `MANUAL_PAYMENT_INSTRUCTIONS` if you want custom instructions shown to buyers after ordering.
+
+Run `cargo run` from `backend/`. Startup creates the database if needed, applies migrations, and prepares the search indexes before the API starts listening on `127.0.0.1:8080`. Wait for the `Tosca Market ready` log message.
+
+### 4. Start the frontend
+
+In a new terminal at the project root, run the following commands.
+
+```powershell
+cd frontend
+bun install
+bun run dev --host 127.0.0.1
+```
+
+Open the [development storefront](http://127.0.0.1:5173). Vite forwards API and upload requests to port `8080`.
+
+To serve a built storefront through Axum, run `bun run build` from `frontend/` and open [the backend URL](http://127.0.0.1:8080). If you use this URL for password recovery, set `APP_URL=http://127.0.0.1:8080` in `backend/.env` and restart the API.
+
+## Seed the local test marketplace
 
 With `backend/.env` configured for your local database, run this from `backend/`.
 
 ```powershell
-cargo run --locked -- --seed-test
+cargo run -- --seed-test
 ```
 
-If the API is already running on Windows, use `cargo run --locked --target-dir target/seed-tool -- --seed-test` to build the seed command separately.
+If the API is already running on Windows, use `cargo run --target-dir target/seed-tool -- --seed-test` to build the seed command separately.
 
 The seed adds 24 shops, 768 products, 2,304 variants, 240 buyers, 48 shop employees, and 10,000 checkouts. Purchase dates span about four years, with more activity in recent months. Seeded listings display product initials in place of fixture photos. The original checkout scenarios, tracking, reviews, returns, notifications, and moderation queues are included. An existing 1,800-checkout seed receives 8,200 additional checkouts. Reruns reuse the same two batches and ask Meilisearch to refresh its indexes.
 
@@ -67,42 +91,19 @@ All active fixture accounts use `ToscaTest2026!` on the local development databa
 | Suspended customer | `buyer240@seed.tosca.invalid` | Blocked customer sign-in |
 | Suspended shop owner | `owner24@seed.tosca.invalid` | Blocked merchant sign-in |
 
-## Run the search stress test
+## Local search-only stress test with Python
 
-The Bun harness targets the local backend at `http://127.0.0.1:8080/api/search` by default and sends only `GET /api/search`. To use a separate seeded release backend for benchmarking, configure it from `backend/` in PowerShell.
+If you have a local copy of `scripts/stress-search.py`, you can use it to send only `GET /api/search` requests to a running local backend. Git ignores the `scripts/` folder, so the harness must be supplied separately on a fresh clone. It uses the Python 3.10+ standard library. [Download Python](https://www.python.org/downloads/)
 
-```powershell
-$env:DATABASE_URL = 'mysql://root:root@127.0.0.1:3306/tosca_market_stress'
-$env:MEILI_INDEX_SUFFIX = '_stress'
-$env:BIND = '127.0.0.1:8086'
-$env:DEMO_CATALOG = 'false'
-$env:ADMIN_EMAIL = ''
-$env:ADMIN_PASSWORD = ''
-cargo run --release --locked -- --seed-test
-cargo run --release --locked
-```
-
-Edit `scripts/.env` to set the target URL, request rates, stage duration, pause between stages, search terms, and output directory. If you start the separate backend above, set `TOSCA_STRESS_URL=http://127.0.0.1:8086/api/search`. Leave `TOSCA_STRESS_SEARCH_BASELINE_URL` blank to test a single backend. For a comparison, set it to a second backend running against the same seeded data. The script alternates which backend goes first at each rate.
-
-Run from the project root.
+Seed the local test marketplace to exercise the default query terms, then run this command from the project root. Pass the backend's base URL to `--url`.
 
 ```powershell
-bun scripts/stress-test.ts
+python scripts/stress-search.py --url http://127.0.0.1:8080 --rps 10 --seconds 30
 ```
 
-The HTML report, JSON summary, and raw CSV measurements are saved in a new timestamped directory under `reports/` unless `TOSCA_STRESS_OUT` names another new directory. Each stage reports p50, p95, p99, successful requests per second, failures, and unsent requests.
+Each run uses a fixed request rate and writes an HTML report, JSON summary, and per-request CSV to a new directory under `reports/`. Repeat `--query` to use terms from your own catalog, or pass `--out` to choose a new output directory. The report includes p50, p95, p99, successful requests per second, failures, and unsent requests. A run passes when p95 is at most 250 ms and at most 1% of scheduled requests fail or go unsent.
 
-### Search-only stress test with Python
-
-With the benchmark backend running, run this from the project root. The script uses the Python 3.10+ standard library and sends only `GET /api/search` requests.
-
-```powershell
-python scripts/stress-search.py --url http://127.0.0.1:8086 --rps 10 --seconds 30
-```
-
-Each run uses one fixed request rate and writes an HTML report, JSON summary, and per-request CSV to a new directory under `reports/`. Pass `--out` to name the directory. Repeat `--query` to replace the six default seeded terms. The report includes p50, p95, p99, successful requests per second, HTTP failures, timeouts, and requests the driver could not send. The script exits with status 1 if p95 exceeds 250 ms or more than 1% of scheduled requests fail or go unsent.
-
-To compare builds, run the same command against each backend with the same seed, query terms, rate, and duration. Run one build at a time and give the search service time to recover between tests that cause timeouts.
+For performance comparisons, run each backend with `cargo run --release` and use the same dataset, search settings, query terms, rate, and duration.
 
 ## Workspaces
 
