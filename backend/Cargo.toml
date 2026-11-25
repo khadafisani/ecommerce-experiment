@@ -31,6 +31,10 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "compression-zstd", "fs", "trace"] }
 
+[target.'cfg(windows)'.dependencies]
+fastembed = { version = "=7.7.1", default-features = false, features = ["directml"] }
+ort = { version = "=2.0.0-rc.15", default-features = false }
+
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 # Allow AWS-LC to build on Windows when NASM is unavailable.
 aws-lc-rs = { version = "1.19", default-features = false, features = ["prebuilt-nasm"] }

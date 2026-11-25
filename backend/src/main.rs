@@ -31,7 +31,7 @@ use sqlx::{
     migrate::MigrateDatabase,
     mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode},
 };
-use std::{env, sync::Arc};
+use std::{env, num::NonZeroU32, sync::Arc};
 use tower::{ServiceExt, service_fn};
 use tower_http::{
     compression::{
@@ -311,6 +311,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let url = env::var("DATABASE_URL")
         .map_err(|_| anyhow::anyhow!("Set DATABASE_URL in the backend environment"))?;
+    let max_connections = setting("DATABASE_POOL_MAX_CONNECTIONS", "100")
+        .parse::<NonZeroU32>()
+        .map_err(|_| anyhow::anyhow!("DATABASE_POOL_MAX_CONNECTIONS must be a positive integer"))?;
     let options: MySqlConnectOptions = url.parse()?;
     let local_db = matches!(
         options.get_host(),
@@ -330,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
         MySql::create_database(&url).await?;
     }
     let db = MySqlPoolOptions::new()
-        .max_connections(12)
+        .max_connections(max_connections.get())
         .connect_with(options)
         .await?;
     let version: String = sqlx::query_scalar("SELECT VERSION()")
@@ -348,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let recommendations = recommendations::Recommendations::new();
     let hybrid_search = setting("SEMANTIC_SEARCH_ENABLED", "false") == "true";
+    let embedding_device = setting("EMBEDDINGS_DEVICE", "cpu").parse()?;
     let embedder =
         embeddings::Embedder::new(!seed_test && (hybrid_search || recommendations.enabled()));
     let app = App {
@@ -390,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
             app.db.clone(),
             embedder,
             app.recommendations.enabled(),
+            embedding_device,
         ));
     }
     let compress_json = SizeAbove::default().and(|_, _, headers: &HeaderMap, _: &Extensions| {

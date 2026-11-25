@@ -1,16 +1,71 @@
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 use sqlx::{Connection, MySql, MySqlConnection, MySqlPool, QueryBuilder};
 use tokio::sync::{Mutex, OnceCell};
 
 pub const MODEL: &str = "e5_small_v1";
 pub const DIMENSIONS: usize = 384;
 const QUERY_EMBEDDING_BUDGET: Duration = Duration::from_secs(1);
+const CPU_BATCH_SIZE: u32 = 8;
+const GPU_BATCH_SIZE: u32 = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    Cpu,
+    DirectMl,
+}
+
+impl FromStr for Device {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "directml" => Ok(Self::DirectMl),
+            _ => anyhow::bail!("EMBEDDINGS_DEVICE must be cpu or directml"),
+        }
+    }
+}
+
+impl Device {
+    fn batch_size(self) -> u32 {
+        match self {
+            Self::Cpu => CPU_BATCH_SIZE,
+            Self::DirectMl => GPU_BATCH_SIZE,
+        }
+    }
+}
+
+fn load_model(device: Device) -> anyhow::Result<TextEmbedding> {
+    let options = TextInitOptions::new(EmbeddingModel::MultilingualE5Small)
+        .with_intra_threads(2)
+        .with_max_length(384)
+        .with_cache_dir(std::env::temp_dir().join("tosca-embedding-models"))
+        .with_show_download_progress(false);
+    let options = match device {
+        Device::Cpu => options.with_auto_device(AutoDevicePolicy::PreferCPU),
+        #[cfg(windows)]
+        Device::DirectMl => options.with_execution_providers(vec![
+            ort::ep::DirectML::default()
+                .with_device_filter(ort::ep::directml::DeviceFilter::Gpu)
+                .build()
+                .error_on_failure(),
+        ]),
+        #[cfg(not(windows))]
+        Device::DirectMl => anyhow::bail!("DirectML requires Windows"),
+    };
+    Ok(TextEmbedding::try_new(options)?)
+}
+
+struct LoadedModel {
+    session: Arc<Mutex<TextEmbedding>>,
+    device: Device,
+}
 
 #[derive(Clone)]
-pub struct Embedder(Option<Arc<OnceCell<Arc<Mutex<TextEmbedding>>>>>);
+pub struct Embedder(Option<Arc<OnceCell<LoadedModel>>>);
 
 impl Embedder {
     pub fn new(enabled: bool) -> Self {
@@ -21,27 +76,37 @@ impl Embedder {
         self.0.is_some()
     }
 
-    async fn initialize(&self) -> anyhow::Result<()> {
+    async fn initialize(&self, device: Device) -> anyhow::Result<()> {
         let Some(cell) = &self.0 else { return Ok(()) };
         cell.get_or_try_init(|| async {
-            let model = tokio::task::spawn_blocking(|| {
-                TextEmbedding::try_new(
-                    TextInitOptions::new(EmbeddingModel::MultilingualE5Small)
-                        .with_intra_threads(2)
-                        .with_max_length(384)
-                        .with_cache_dir(std::env::temp_dir().join("tosca-embedding-models"))
-                        .with_show_download_progress(false),
-                )
+            tokio::task::spawn_blocking(move || {
+                let (model, device) = match load_model(device) {
+                    Ok(model) => (model, device),
+                    Err(error) if device == Device::DirectMl => {
+                        tracing::warn!(%error, "DirectML initialization failed; using CPU embeddings");
+                        (load_model(Device::Cpu)?, Device::Cpu)
+                    }
+                    Err(error) => return Err(error),
+                };
+                tracing::info!(
+                    model = MODEL,
+                    ?device,
+                    catalog_batch_size = device.batch_size(),
+                    "local text embedder ready"
+                );
+                Ok(LoadedModel {
+                    session: Arc::new(Mutex::new(model)),
+                    device,
+                })
             })
-            .await??;
-            Ok::<_, anyhow::Error>(Arc::new(Mutex::new(model)))
+            .await?
         })
         .await?;
         Ok(())
     }
 
     pub async fn query(&self, query: &str) -> Option<Vec<f32>> {
-        let model = self.0.as_ref()?.get()?;
+        let model = &self.0.as_ref()?.get()?.session;
         let query = format!("query: {query}");
         // Give concurrent searches a chance to use the model before falling back.
         let vectors = tokio::time::timeout(QUERY_EMBEDDING_BUDGET, async {
@@ -100,6 +165,7 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
     let Some(model) = embedder.0.as_ref().and_then(|value| value.get()) else {
         return Ok(false);
     };
+    let batch_size = model.device.batch_size();
     let mut connection = MySqlConnection::connect_with(&pool.connect_options()).await?;
     let owns_job: Option<i32> =
         sqlx::query_scalar("SELECT GET_LOCK(CONCAT('tosca-embeddings-',MD5(DATABASE())),0)")
@@ -114,9 +180,10 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
              WHERE t.id=e.product_id AND SHA2(t.passage,256)=e.fingerprint) AS passage
          FROM product_embeddings e FORCE INDEX (embedding_due)
          WHERE e.model=? AND e.next_attempt_at<=UTC_TIMESTAMP(6)
-         ORDER BY e.next_attempt_at,e.product_id LIMIT 8",
+         ORDER BY e.next_attempt_at,e.product_id LIMIT ?",
     )
     .bind(MODEL)
+    .bind(batch_size)
     .fetch_all(&mut connection)
     .await?;
     if jobs.is_empty() {
@@ -127,8 +194,18 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
         Vec::new().into_iter()
     } else {
         let count = passages.len();
-        let mut model = Arc::clone(model).lock_owned().await;
-        let vectors = tokio::task::spawn_blocking(move || model.embed(passages, Some(8))).await??;
+        let device = model.device;
+        let mut session = Arc::clone(&model.session).lock_owned().await;
+        let vectors = tokio::task::spawn_blocking(move || {
+            match session.embed(&passages, Some(batch_size as usize)) {
+                Err(error) if device == Device::DirectMl && count > CPU_BATCH_SIZE as usize => {
+                    tracing::warn!(%error, count, "DirectML batch failed; retrying in smaller batches");
+                    session.embed(passages, Some(CPU_BATCH_SIZE as usize))
+                }
+                result => result,
+            }
+        })
+        .await??;
         anyhow::ensure!(vectors.len() == count, "Embedding batch size mismatch");
         vectors.into_iter()
     };
@@ -199,13 +276,13 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
     Ok(true)
 }
 
-pub async fn worker(pool: MySqlPool, embedder: Embedder, recommendations: bool) {
+pub async fn worker(pool: MySqlPool, embedder: Embedder, recommendations: bool, device: Device) {
     if recommendations {
         tokio::spawn(prune_signals(pool.clone()));
     }
     loop {
         match embedder
-            .initialize()
+            .initialize(device)
             .await
             .context("loading multilingual E5 model")
         {
@@ -216,7 +293,6 @@ pub async fn worker(pool: MySqlPool, embedder: Embedder, recommendations: bool) 
             }
         }
     }
-    tracing::info!(model = MODEL, "local text embedder ready");
     loop {
         let delay = match publish(&pool, &embedder).await {
             Ok(true) => Duration::from_millis(100),
