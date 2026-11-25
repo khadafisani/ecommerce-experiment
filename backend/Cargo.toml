@@ -11,7 +11,7 @@ sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-url = "2.5"
+url = "2.5.9"
 time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 argon2 = "0.6"
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
@@ -21,18 +21,19 @@ csv = "1.4"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["io"] }
 meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls", "jwt_aws_lc_rs"] }
 lettre = { version = "0.11.24", features = ["tokio1-native-tls"] }
 hex = "0.4"
 img4avif = { version = "0.7", default-features = false }
-stoolap = { version = "=0.5.0", default-features = false, features = ["parallel"] }
-fastembed = { version = "=7.7.1", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+stoolap = { version = "=0.5.1", default-features = false, features = ["parallel"] }
+fastembed = { version = "=7.8.0", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls", "onig"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["compression-br", "compression-gzip", "compression-zstd", "fs", "trace"] }
 
 [target.'cfg(windows)'.dependencies]
-fastembed = { version = "=7.7.1", default-features = false, features = ["directml"] }
+fastembed = { version = "=7.8.0", default-features = false, features = ["directml"] }
 ort = { version = "=2.0.0-rc.15", default-features = false }
 
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]

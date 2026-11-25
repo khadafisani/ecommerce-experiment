@@ -2,6 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use anyhow::Context;
 use axum::extract::{Query, State};
+use futures_util::io::Cursor;
 use meilisearch_sdk::{
     client::Client,
     errors::{Error as MeiliError, ErrorCode},
@@ -23,9 +24,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const INDEX_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const STARTUP_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const TASK_TIMEOUT: Duration = Duration::from_secs(15);
-const BULK_TASK_TIMEOUT: Duration = Duration::from_secs(600);
-const LIVE_BATCH_SIZE: u32 = 256;
-const BULK_BATCH_SIZE: u32 = 50_000;
+const DOCUMENT_TASK_TIMEOUT: Duration = Duration::from_secs(600);
+const BATCH_SIZE: u32 = 20_000;
+// Leave headroom below Meilisearch's default 100 MB HTTP payload limit.
+const MAX_DOCUMENT_PAYLOAD_BYTES: usize = 90 * 1024 * 1024;
 const SQL_BATCH_SIZE: usize = 10_000;
 
 #[derive(Clone)]
@@ -341,8 +343,6 @@ async fn publish_batch(
     conn: &mut MySqlConnection,
     index: &Index,
     definition: &IndexDefinition,
-    batch_size: u32,
-    task_timeout: Duration,
 ) -> anyhow::Result<usize> {
     let query = sqlx::query_as(definition.select_jobs);
     let query = if definition.entity_type == "product" {
@@ -350,25 +350,38 @@ async fn publish_batch(
     } else {
         query
     };
-    let jobs: Vec<Job> = query.bind(batch_size).fetch_all(&mut *conn).await?;
+    let jobs: Vec<Job> = query.bind(BATCH_SIZE).fetch_all(&mut *conn).await?;
     if jobs.is_empty() {
         return Ok(0);
     }
-    let count = jobs.len();
-
-    let mut upserts = Vec::new();
+    let mut published = jobs.len();
+    let mut ndjson = Vec::new();
     let mut removed = Vec::new();
     let mut products = Vec::new();
-    for job in &jobs {
+    for (position, job) in jobs.iter().enumerate() {
         match &job.document {
             Some(document) => {
                 let mut document = serde_json::from_str::<Value>(document)?;
                 if definition.entity_type == "product" {
-                    products.push(job.entity_id);
                     document["_vectors"] =
                         json!({(embeddings::MODEL): job.embedding.as_ref().map(|v| &v.0)});
                 }
-                upserts.push(document);
+                let line_start = ndjson.len();
+                serde_json::to_writer(&mut ndjson, &document)?;
+                ndjson.push(b'\n');
+                if ndjson.len() > MAX_DOCUMENT_PAYLOAD_BYTES {
+                    anyhow::ensure!(
+                        line_start > 0,
+                        "Search document {} exceeds the payload limit",
+                        job.entity_id
+                    );
+                    ndjson.truncate(line_start);
+                    published = position;
+                    break;
+                }
+                if definition.entity_type == "product" {
+                    products.push(job.entity_id);
+                }
             }
             None => removed.push(job.entity_id),
         }
@@ -380,21 +393,27 @@ async fn publish_batch(
         wait_for_task_with_timeout(
             &search.client,
             index.delete_documents(&removed).await?,
-            task_timeout,
+            DOCUMENT_TASK_TIMEOUT,
         )
         .await?;
     }
-    if !upserts.is_empty() {
+    if !ndjson.is_empty() {
         wait_for_task_with_timeout(
             &search.client,
-            index.add_or_replace(&upserts, Some("id")).await?,
-            task_timeout,
+            index
+                .add_or_update_unchecked_payload(
+                    Cursor::new(ndjson),
+                    "application/x-ndjson",
+                    Some("id"),
+                )
+                .await?,
+            DOCUMENT_TASK_TIMEOUT,
         )
         .await?;
     }
 
     // A newer revision can arrive while Meilisearch is indexing. Only acknowledge the published revisions.
-    for batch in jobs.chunks(SQL_BATCH_SIZE) {
+    for batch in jobs[..published].chunks(SQL_BATCH_SIZE) {
         let mut delete =
             QueryBuilder::<MySql>::new("DELETE FROM search_sync_jobs WHERE entity_type=");
         delete
@@ -412,7 +431,7 @@ async fn publish_batch(
         pairs.push_unseparated(")");
         delete.build().persistent(false).execute(&mut *conn).await?;
     }
-    Ok(count)
+    Ok(published)
 }
 
 async fn pending(conn: &mut MySqlConnection) -> anyhow::Result<bool> {
@@ -423,22 +442,21 @@ async fn pending(conn: &mut MySqlConnection) -> anyhow::Result<bool> {
     )
 }
 
-async fn publish_pending(search: &Search, conn: &mut MySqlConnection) -> anyhow::Result<()> {
+async fn publish_pending(search: &Search, conn: &mut MySqlConnection) -> anyhow::Result<usize> {
+    let mut products = 0;
     for (index, definition) in search.indexes() {
-        tokio::time::timeout(
-            Duration::from_secs(40),
-            publish_batch(
-                search,
-                conn,
-                index,
-                definition,
-                LIVE_BATCH_SIZE,
-                TASK_TIMEOUT,
-            ),
+        let count = tokio::time::timeout(
+            DOCUMENT_TASK_TIMEOUT * 2 + Duration::from_secs(30),
+            publish_batch(search, conn, index, definition),
         )
-        .await??;
+        .await
+        .with_context(|| format!("Timed out syncing index {}", index.uid))?
+        .with_context(|| format!("Syncing index {}", index.uid))?;
+        if definition.entity_type == "product" {
+            products = count;
+        }
     }
-    Ok(())
+    Ok(products)
 }
 
 async fn prepare_locked(search: &Search, conn: &mut MySqlConnection) -> anyhow::Result<()> {
@@ -557,23 +575,10 @@ pub(super) async fn sync_bulk(db: &sqlx::MySqlPool, search: &Search) -> anyhow::
     ensure_indexes(search, &mut conn, true).await?;
     let mut processed = 0;
     while pending(&mut conn).await? {
-        for (index, definition) in search.indexes() {
-            let count = publish_batch(
-                search,
-                &mut conn,
-                index,
-                definition,
-                BULK_BATCH_SIZE,
-                BULK_TASK_TIMEOUT,
-            )
-            .await
-            .with_context(|| format!("Syncing index {}", index.uid))?;
-            if count > 0 && definition.entity_type == "product" {
-                processed += count;
-                if processed.is_multiple_of(50_000) {
-                    tracing::info!(processed, index = %index.uid, "Amazon import search updates applied");
-                }
-            }
+        let previous = processed;
+        processed += publish_pending(search, &mut conn).await?;
+        if processed / 50_000 > previous / 50_000 {
+            tracing::info!(processed, index = %search.products.uid, "Amazon import search updates applied");
         }
     }
     conn.close().await?;
