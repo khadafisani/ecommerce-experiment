@@ -2,22 +2,22 @@
 
 A compact Indonesian marketplace with a Svelte storefront and separate merchant and admin workspaces.
 
-| Folder | Contents |
-| --- | --- |
-| `frontend/` | Svelte 5.58.0, Bun 1.4.4, Vite, and UI assets |
-| `backend/` | Rust 1.100.0, Axum 0.8.9, MariaDB migrations, demo fixtures, and backend configuration |
+| Folder      | Contents                                                                               |
+| ----------- | -------------------------------------------------------------------------------------- |
+| `frontend/` | Svelte 5.58.0, Bun 1.4.4, Vite, and UI assets                                          |
+| `backend/`  | Rust 1.100.0, Axum 0.8.9, MariaDB migrations, demo fixtures, and backend configuration |
 
 ## Run locally
 
 ### 1. Install the prerequisites
 
-| Dependency | Download and setup |
-| --- | --- |
-| Git | Install Git if you need to clone the repository. [Git downloads](https://git-scm.com/downloads/) |
-| Rust 1.100.0 | Install with `rustup`. The backend pins the toolchain in [`rust-toolchain.toml`](backend/rust-toolchain.toml). On Windows, install the Visual Studio C++ Build Tools if prompted by the installer. [Install Rust](https://rust-lang.org/tools/install/) |
-| Bun 1.4.4 | Use Bun to install frontend dependencies and run Vite. [Bun downloads](https://bun.com/), [v1.4.4 release](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.4) |
-| MariaDB 12.3.4 | Choose the server package for your platform. On Windows, the MSI can install MariaDB as a service. Set a root password and enable TCP/IP on port `3306` during setup. [Download MariaDB](https://mariadb.org/download/?t=mariadb&p=mariadb&r=12.3.4) |
-| Meilisearch 1.57.0 | Download the binary for your OS and architecture from the release assets. For Windows x64, use `meilisearch-windows-amd64.exe`. [Meilisearch release](https://github.com/meilisearch/meilisearch/releases#release-v1.57.0) |
+| Dependency         | Download and setup                                                                                                                                                                                                                                      |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git                | Install Git if you need to clone the repository. [Git downloads](https://git-scm.com/downloads/)                                                                                                                                                        |
+| Rust 1.100.0       | Install with `rustup`. The backend pins the toolchain in [`rust-toolchain.toml`](backend/rust-toolchain.toml). On Windows, install the Visual Studio C++ Build Tools if prompted by the installer. [Install Rust](https://rust-lang.org/tools/install/) |
+| Bun 1.4.4          | Use Bun to install frontend dependencies and run Vite. [Bun downloads](https://bun.com/), [v1.4.4 release](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.4)                                                                                      |
+| MariaDB 12.3.4     | Choose the server package for your platform. On Windows, the MSI can install MariaDB as a service. Set a root password and enable TCP/IP on port `3306` during setup. [Download MariaDB](https://mariadb.org/download/?t=mariadb&p=mariadb&r=12.3.4)    |
+| Meilisearch 1.57.0 | Download the binary for your OS and architecture from the release assets. For Windows x64, use `meilisearch-windows-amd64.exe`. [Meilisearch release](https://github.com/meilisearch/meilisearch/releases#release-v1.57.0)                              |
 
 To clone the repository and enter the project root, run the following commands.
 
@@ -83,28 +83,14 @@ The seed adds 24 shops, 768 products, 2,304 variants, 240 buyers, 48 shop employ
 
 Set `ALLOW_TEST_ACCOUNTS=true` only on the isolated local development backend to sign in to fixture accounts with `ToscaTest2026!`. Fixture sign-in and existing fixture sessions are disabled by default.
 
-| Sign in | Email | What to test |
-| --- | --- | --- |
-| Customer | `buyer001@seed.tosca.invalid` | Order history, saved addresses, unavailable cart items, tracking and returns |
-| Merchant owner | `owner01@seed.tosca.invalid` | Product pagination, sales charts, order fulfillment and team management |
-| Merchant employee | `staff01-1@seed.tosca.invalid` | Pagi Studio orders and product actions |
-| Admin | `admin@seed.tosca.invalid` | Moderation, manual payments, user and shop management, and marketplace charts |
-| Suspended customer | `buyer240@seed.tosca.invalid` | Blocked customer sign-in |
-| Suspended shop owner | `owner24@seed.tosca.invalid` | Blocked merchant sign-in |
-
-## Local search-only stress test with Python
-
-If you have a local copy of `scripts/stress-search.py`, you can use it to send only `GET /api/search` requests to a running local backend. Git ignores the `scripts/` folder, so the harness must be supplied separately on a fresh clone. It uses the Python 3.10+ standard library. [Download Python](https://www.python.org/downloads/)
-
-Seed the local test marketplace to exercise the default query terms, then run this command from the project root. Pass the backend's base URL to `--url`.
-
-```powershell
-python scripts/stress-search.py --url http://127.0.0.1:8080 --rps 10 --seconds 30
-```
-
-Each run uses a fixed request rate and writes an HTML report, JSON summary, and per-request CSV to a new directory under `reports/`. Repeat `--query` to use terms from your own catalog, or pass `--out` to choose a new output directory. The report includes p50, p95, p99, successful requests per second, failures, and unsent requests. A run passes when p95 is at most 250 ms and at most 1% of scheduled requests fail or go unsent.
-
-For performance comparisons, run each backend with `cargo run --release` and use the same dataset, search settings, query terms, rate, and duration.
+| Sign in              | Email                          | What to test                                                                  |
+| -------------------- | ------------------------------ | ----------------------------------------------------------------------------- |
+| Customer             | `buyer001@seed.tosca.invalid`  | Order history, saved addresses, unavailable cart items, tracking and returns  |
+| Merchant owner       | `owner01@seed.tosca.invalid`   | Product pagination, sales charts, order fulfillment and team management       |
+| Merchant employee    | `staff01-1@seed.tosca.invalid` | Pagi Studio orders and product actions                                        |
+| Admin                | `admin@seed.tosca.invalid`     | Moderation, manual payments, user and shop management, and marketplace charts |
+| Suspended customer   | `buyer240@seed.tosca.invalid`  | Blocked customer sign-in                                                      |
+| Suspended shop owner | `owner24@seed.tosca.invalid`   | Blocked merchant sign-in                                                      |
 
 ## Workspaces
 
