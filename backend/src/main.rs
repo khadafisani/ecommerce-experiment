@@ -366,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
         allow_test_accounts: setting("ALLOW_TEST_ACCOUNTS", "false") == "true",
         app_url: Arc::new(storefront_url(&setting(
             "APP_URL",
-            "http://127.0.0.1:5173",
+            "http://localhost:5173",
         ))?),
     };
     anyhow::ensure!(

@@ -63,10 +63,10 @@ In a new terminal at the project root, run the following commands.
 ```powershell
 cd frontend
 bun install --frozen-lockfile
-bun run dev --host 127.0.0.1
+bun run dev
 ```
 
-Open the [development storefront](http://127.0.0.1:5173). Vite forwards API and upload requests to port `8080`.
+Open the [development storefront](http://localhost:5173). Vite forwards API and upload requests to port `8080`.
 
 To serve a built storefront through Axum, run `bun run build` from `frontend/`, set `APP_URL=http://127.0.0.1:8080` in `backend/.env`, restart the API, and open [the backend URL](http://127.0.0.1:8080).
 

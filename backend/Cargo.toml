@@ -23,6 +23,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
 meilisearch-sdk = { version = "0.33", default-features = false, features = ["reqwest", "tls", "jwt_aws_lc_rs"] }
+# Enable response gzip negotiation and decoding in the Meilisearch SDK's HTTP client.
+reqwest = { version = "0.12", default-features = false, features = ["gzip"] }
 lettre = { version = "0.11.24", features = ["tokio1-native-tls"] }
 hex = "0.4"
 img4avif = { version = "0.7", default-features = false }
