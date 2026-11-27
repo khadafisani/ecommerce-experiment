@@ -10,7 +10,9 @@ export type SearchHit = {
   lowest_price?:number|null;
 };
 type SearchDocument = Omit<SearchHit,'kind'>;
-export type SearchResponse = { items: SearchHit[] } | { items: SearchDocument[]; shops: SearchDocument[] };
+export type SearchResponse = (
+  { items: SearchHit[] } | { items: SearchDocument[]; shops: SearchDocument[] }
+) & { keywords?: { phrase: string }[]; corrected_query?: string };
 export type SearchGroups = { products: SearchHit[]; shops: SearchHit[] };
 
 export function groupSearchHits(response: SearchResponse): SearchGroups {

@@ -27,6 +27,7 @@
   const storefrontHome = page === '' && !category;
   let account = $state<Row|null>(null), cartCount = $state(guestCart().reduce((sum,row)=>sum+row.quantity,0));
   let searchGroups = $state.raw<SearchGroups>({ products: [], shops: [] });
+  let correctedQuery = $state('');
   const pager = new CursorPager<Row & {id:number}, number | string>();
   let sort = $state<'for-you' | 'newest' | 'oldest'>(storefrontHome ? 'for-you' : 'newest');
   let hasForYou = $state(storefrontHome);
@@ -66,10 +67,11 @@
       await pager.reset((cursor, signal)=>api('/products'+params({...filters,cursor}), 'GET', undefined, true, signal));
       return;
     }
-    busy=true;error='';
+    busy=true;error='';correctedQuery='';
     try {
       const result=await api<SearchResponse>('/search'+params({q:search.get('q')}), 'GET', undefined, true, lifetime.signal);
       searchGroups=groupSearchHits(result);
+      correctedQuery=result.corrected_query ?? '';
     }catch(e){if(!lifetime.signal.aborted)error=message(e);}finally{busy=false;}
   }
 
@@ -198,6 +200,9 @@
       {#if catalogError}
         <p class="error" role="alert">{catalogError} <button onclick={()=>load()}>Retry</button></p>
       {:else if page==='search'}
+        {#if correctedQuery}
+          <p role="status">Showing product results for <strong>{correctedQuery}</strong>.</p>
+        {/if}
         {#if searchGroups.products.length}
           <section class="search-result-group" aria-labelledby="search-products-title">
             <h3 id="search-products-title">Products</h3>

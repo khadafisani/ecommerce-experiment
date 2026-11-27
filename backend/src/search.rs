@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use axum::extract::{Query, State};
@@ -17,6 +17,9 @@ use sqlx::{Connection, MySqlConnection, MySqlPool, QueryBuilder};
 
 use crate::{App, Error, Json, MySql, Result, StatusCode, Value, embeddings, json, setting, text};
 
+mod canonical;
+mod extractor;
+mod keywords;
 mod products;
 mod shops;
 
@@ -35,8 +38,11 @@ pub struct Search {
     client: Client,
     products: Index,
     shops: Index,
+    keywords: Index,
+    canonical: Index,
     hybrid: bool,
     embedder: embeddings::Embedder,
+    query_logging: Arc<tokio::sync::Semaphore>,
 }
 
 impl Search {
@@ -51,9 +57,12 @@ impl Search {
         Ok(Self {
             products: client.index(format!("{}{suffix}", products::INDEX.uid_prefix)),
             shops: client.index(format!("{}{suffix}", shops::INDEX.uid_prefix)),
+            keywords: client.index(format!("{}{suffix}", keywords::INDEX)),
+            canonical: client.index(format!("{}{suffix}", canonical::INDEX)),
             client,
             hybrid,
             embedder,
+            query_logging: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
 
@@ -76,7 +85,7 @@ pub async fn query(State(app): State<App>, Query(options): Query<SearchQuery>) -
     let search = &app.search;
     let q = options.q.as_deref().unwrap_or("").trim();
     if q.is_empty() {
-        return Ok(Json(json!({"items":[], "shops":[]})));
+        return Ok(Json(json!({"items":[], "shops":[], "keywords":[]})));
     }
     let q = text(q, 150)?;
 
@@ -88,20 +97,92 @@ pub async fn query(State(app): State<App>, Query(options): Query<SearchQuery>) -
         .with_attributes_to_retrieve(Selectors::Some(shops::INDEX.displayed))
         .build();
 
-    let (items, shops) = tokio::time::timeout(Duration::from_secs(3), async {
-        tokio::try_join!(
-            search.product_results(q, options.suggest),
-            shops.execute::<Value>()
-        )
-    })
-    .await
-    .map_err(unavailable)?
-    .map_err(unavailable)?;
-
-    let shops = shops.hits.into_iter().map(|hit| hit.result);
-    let products = hit_ids(items);
-    let shops = hit_ids(shops);
-    visible_hits(&app.db, &products, &shops).await
+    if !options.suggest
+        && let Ok(permit) = Arc::clone(&search.query_logging).try_acquire_owned()
+    {
+        let db = app.db.clone();
+        let submitted = q.to_owned();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match tokio::time::timeout(
+                Duration::from_millis(500),
+                keywords::record(&db, &submitted),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::debug!(%error, "could not record submitted search"),
+                Err(_) => tracing::debug!("recording submitted search timed out"),
+            }
+        });
+    }
+    let shops = async {
+        let shops = shops.execute::<Value>().await.map_err(unavailable)?;
+        Ok::<_, Error>(hit_ids(shops.hits.into_iter().map(|hit| hit.result)))
+    };
+    let products = async {
+        if options.suggest {
+            let suggestions = keywords::suggest(search, q).await;
+            let fallback = if suggestions.is_empty() {
+                search.listing_suggestions(q).await.map_err(unavailable)?
+            } else {
+                Vec::new()
+            };
+            return Ok((Vec::new(), fallback, suggestions, None));
+        }
+        let mut correction = keywords::correction(search, q).await;
+        let term = correction.as_deref().unwrap_or(q);
+        let mut canonical = Vec::new();
+        match canonical::hits(search, &app.db, term, correction.is_none()).await {
+            Ok((hits, hint)) => {
+                canonical = canonical::offers(&app.db, hits, hint.as_deref().unwrap_or(term))
+                    .await
+                    .map_err(unavailable)?;
+                if !canonical.is_empty() && hint.is_some() {
+                    correction = hint;
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "canonical search unavailable; using listing keywords")
+            }
+        }
+        let fallback = if canonical.is_empty() {
+            let term = correction.as_deref().unwrap_or(q);
+            let filters = canonical::offer_filters(term);
+            if filters.constrained() {
+                let ids = hit_ids(
+                    search
+                        .listing_results_with_limit(&filters.terms, 24, MatchingStrategies::ALL)
+                        .await
+                        .map_err(unavailable)?,
+                );
+                canonical = canonical::listing_offers(&app.db, &ids, term)
+                    .await
+                    .map_err(unavailable)?;
+                Vec::new()
+            } else {
+                hit_ids(search.listing_results(term).await.map_err(unavailable)?)
+            }
+        } else {
+            Vec::new()
+        };
+        Ok((canonical, fallback, Vec::new(), correction))
+    };
+    let ((canonical, fallback, suggestions, corrected), shops) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::try_join!(products, shops)
+        })
+        .await
+        .map_err(unavailable)??;
+    let Json(mut response) = visible_hits(&app.db, &fallback, &shops).await?;
+    if !canonical.is_empty() {
+        response["items"] = json!(canonical);
+    }
+    response["keywords"] = json!(suggestions);
+    if let Some(corrected) = corrected {
+        response["corrected_query"] = json!(corrected);
+    }
+    Ok(Json(response))
 }
 
 fn hit_ids(hits: impl IntoIterator<Item = Value>) -> Vec<i64> {
@@ -185,33 +266,43 @@ impl Search {
         )
     }
 
-    async fn product_results(
+    async fn listing_results(&self, query: &str) -> std::result::Result<Vec<Value>, MeiliError> {
+        self.listing_results_with_limit(query, 6, MatchingStrategies::LAST)
+            .await
+    }
+
+    async fn listing_suggestions(&self, query: &str) -> std::result::Result<Vec<i64>, MeiliError> {
+        const FIELDS: &[&str] = &["name", "brand", "category"];
+        let mut request = self.products.search();
+        request
+            .with_query(query)
+            .with_limit(24)
+            .with_matching_strategy(MatchingStrategies::ALL)
+            .with_attributes_to_retrieve(Selectors::Some(&["id", "name", "brand", "category"]))
+            .with_show_matches_position(true);
+        let result = request.execute::<Value>().await?;
+        Ok(hit_ids(
+            result
+                .hits
+                .into_iter()
+                .filter(|hit| keywords::leading_match(hit.matches_position.as_ref(), FIELDS))
+                .take(6)
+                .map(|hit| hit.result),
+        ))
+    }
+
+    async fn listing_results_with_limit(
         &self,
         query: &str,
-        suggest: bool,
+        limit: usize,
+        matching: MatchingStrategies,
     ) -> std::result::Result<Vec<Value>, MeiliError> {
         let mut request = self.products.search();
         request
             .with_query(query)
-            .with_limit(6)
+            .with_limit(limit)
+            .with_matching_strategy(matching)
             .with_attributes_to_retrieve(Selectors::Some(products::INDEX.displayed));
-        if self.hybrid
-            && !suggest
-            && let Some(vector) = self.embedder.query(query).await
-        {
-            let mut hybrid = request.clone();
-            hybrid
-                .with_hybrid(embeddings::MODEL, 0.35)
-                .with_vector(&vector);
-            match tokio::time::timeout(Duration::from_millis(750), hybrid.execute::<Value>()).await
-            {
-                Ok(Ok(result)) => {
-                    return Ok(result.hits.into_iter().map(|hit| hit.result).collect());
-                }
-                Ok(Err(error)) => tracing::debug!(%error, "hybrid search fell back to lexical"),
-                Err(_) => tracing::debug!("hybrid search timed out; falling back to lexical"),
-            }
-        }
         Ok(request
             .execute::<Value>()
             .await?
@@ -244,7 +335,6 @@ struct Job {
     entity_id: i64,
     revision: u64,
     document: Option<String>,
-    embedding: Option<sqlx::types::Json<Vec<f32>>>,
 }
 
 async fn locked_connection(app: &App) -> anyhow::Result<Option<MySqlConnection>> {
@@ -344,13 +434,10 @@ async fn publish_batch(
     index: &Index,
     definition: &IndexDefinition,
 ) -> anyhow::Result<usize> {
-    let query = sqlx::query_as(definition.select_jobs);
-    let query = if definition.entity_type == "product" {
-        query.bind(embeddings::MODEL)
-    } else {
-        query
-    };
-    let jobs: Vec<Job> = query.bind(BATCH_SIZE).fetch_all(&mut *conn).await?;
+    let jobs: Vec<Job> = sqlx::query_as(definition.select_jobs)
+        .bind(BATCH_SIZE)
+        .fetch_all(&mut *conn)
+        .await?;
     if jobs.is_empty() {
         return Ok(0);
     }
@@ -363,8 +450,8 @@ async fn publish_batch(
             Some(document) => {
                 let mut document = serde_json::from_str::<Value>(document)?;
                 if definition.entity_type == "product" {
-                    document["_vectors"] =
-                        json!({(embeddings::MODEL): job.embedding.as_ref().map(|v| &v.0)});
+                    // The listing index handles lexical fallback. Remove old vectors on update.
+                    document["_vectors"] = json!({(embeddings::MODEL):null});
                 }
                 let line_start = ndjson.len();
                 serde_json::to_writer(&mut ndjson, &document)?;
@@ -386,8 +473,22 @@ async fn publish_batch(
             None => removed.push(job.entity_id),
         }
     }
-    for ids in products.chunks(SQL_BATCH_SIZE) {
-        embeddings::enqueue(&mut *conn, ids).await?;
+    if definition.entity_type == "product" {
+        for ids in products.chunks(SQL_BATCH_SIZE) {
+            embeddings::enqueue(&mut *conn, ids).await?;
+        }
+        let ids: Vec<_> = jobs[..published].iter().map(|job| job.entity_id).collect();
+        for ids in ids.chunks(SQL_BATCH_SIZE) {
+            sqlx::query(
+                "INSERT INTO search_catalog_jobs (product_id)
+                 SELECT hits.id FROM JSON_TABLE(?, '$[*]' COLUMNS(id BIGINT PATH '$')) hits
+                 JOIN search_catalog_cursor c ON c.id=1 AND (c.backfill_complete OR hits.id<=c.last_product_id)
+                 ON DUPLICATE KEY UPDATE revision=revision+1,updated_at=CURRENT_TIMESTAMP(6)",
+            )
+            .bind(json!(ids).to_string())
+            .execute(&mut *conn)
+            .await?;
+        }
     }
     if !removed.is_empty() {
         wait_for_task_with_timeout(
@@ -543,6 +644,10 @@ pub async fn index_worker(app: App) {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+pub async fn cleanup_worker(app: App) {
+    canonical::worker(app.db, app.search).await;
 }
 
 pub async fn rebuild(app: &App) -> anyhow::Result<()> {

@@ -15,15 +15,12 @@ pub(super) const INDEX: IndexDefinition = IndexDefinition {
             'id',p.id,'name',p.name,'image',p.image,'shop_id',s.id,'shop',s.name,
             'category',c.name,'brand',b.name,'description',p.description,
             'lowest_price',(SELECT MIN(v.price) FROM variants v WHERE v.product_id=p.id AND v.enabled)
-        ) END AS document,e.embedding
+        ) END AS document
         FROM search_sync_jobs j
         LEFT JOIN products p ON p.id=j.entity_id
         LEFT JOIN shops s ON s.id=p.shop_id
         LEFT JOIN taxonomy c ON c.id=p.category_id
         LEFT JOIN taxonomy b ON b.id=p.brand_id
-        LEFT JOIN recommendation_product_text t ON t.id=p.id
-        LEFT JOIN product_embeddings e ON e.product_id=p.id AND e.model=?
-            AND e.fingerprint=SHA2(t.passage,256)
         WHERE j.entity_type='product' ORDER BY j.updated_at,j.entity_id LIMIT ?",
 };
 

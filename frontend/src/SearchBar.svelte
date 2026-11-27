@@ -13,9 +13,11 @@
     import SearchKindBadge from "./SearchKindBadge.svelte";
 
     let { initialQuery = "" }: { initialQuery?: string } = $props();
+    type Suggestion = SearchHit | { kind: "keyword"; name: string };
     let query = $derived(initialQuery);
     let groups = $state.raw<SearchGroups>({ products: [], shops: [] });
-    let matches = $derived([...groups.products, ...groups.shops]);
+    let keywords = $state.raw<Suggestion[]>([]);
+    let matches = $derived([...keywords, ...groups.products, ...groups.shops]);
     let phase = $state<"idle" | "loading" | "ready" | "error">("idle");
     let focused = $state(false);
     let activeIndex = $state(-1);
@@ -44,6 +46,7 @@
         const term = query.trim();
         activeIndex = -1;
         groups = { products: [], shops: [] };
+        keywords = [];
         if (!focused || term.length < 2) {
             phase = "idle";
             return;
@@ -60,13 +63,17 @@
                 controller.signal,
                 AbortSignal.timeout(30_000),
             ]);
-            const response = await fetch("/api/search" + params({ q: term }), {
+            const response = await fetch("/api/search" + params({ q: term, suggest: "true" }), {
                 signal,
             });
             if (!response.ok) throw new Error("Search unavailable");
             const result: SearchResponse = await response.json();
             if (controller.signal.aborted) return;
             groups = groupSearchHits(result);
+            keywords = (result.keywords ?? []).map(({ phrase }) => ({
+                kind: "keyword",
+                name: phrase,
+            }));
             phase = "ready";
         } catch {
             if (!controller.signal.aborted) phase = "error";
@@ -103,7 +110,7 @@
             );
         } else if (event.key === "Enter" && hasOptions && activeIndex >= 0) {
             event.preventDefault();
-            location.assign(searchHitPath(matches[activeIndex]));
+            location.assign(suggestionPath(matches[activeIndex]));
         }
     }
 
@@ -121,16 +128,22 @@
     function optionId(index: number) {
         return listId + "-" + index;
     }
+
+    function suggestionPath(match: Suggestion) {
+        return match.kind === "keyword"
+            ? "/search" + params({ q: match.name })
+            : searchHitPath(match);
+    }
 </script>
 
-{#snippet suggestionGroup(label: string, hits: SearchHit[], offset: number)}
+{#snippet suggestionGroup(label: string, hits: Suggestion[], offset: number)}
     {#if hits.length}
         <div role="group" aria-label={label}>
             <div class="suggestion-heading" aria-hidden="true">{label}</div>
-            {#each hits as match, index (searchHitPath(match))}
+            {#each hits as match, index (suggestionPath(match))}
                 {@const position = offset + index}
                 <a
-                    href={searchHitPath(match)}
+                    href={suggestionPath(match)}
                     id={optionId(position)}
                     role="option"
                     aria-selected={activeIndex === position}
@@ -140,21 +153,25 @@
                         if (event.button === 0) event.preventDefault();
                     }}
                 >
-                    {#if match.kind === "shop"}<Store
+                    {#if match.kind === "keyword"}
+                        <Search size={16} aria-hidden="true" />
+                    {:else if match.kind === "shop"}<Store
                             size={16}
                             aria-hidden="true"
                         />{/if}
                     <span class="search-match-name">
-                        <strong>{match.name}</strong>{#if match.shop}<small>
+                        <strong>{match.name}</strong>{#if match.kind !== "keyword" && match.shop}<small>
                                 {match.shop}
                             </small>{/if}
                     </span>
-                    <span class="search-match-details">
-                        <SearchKindBadge kind={match.kind} />
-                        {#if match.lowest_price != null}<small>
-                                {money(match.lowest_price)}
-                            </small>{/if}
-                    </span>
+                    {#if match.kind !== "keyword"}
+                        <span class="search-match-details">
+                            <SearchKindBadge kind={match.kind} />
+                            {#if match.lowest_price != null}<small>
+                                    {money(match.lowest_price)}
+                                </small>{/if}
+                        </span>
+                    {/if}
                 </a>
             {/each}
         </div>
@@ -207,11 +224,12 @@
         <div class="search-popup">
             {#if hasOptions}
                 <div id={listId} role="listbox" aria-label="Search suggestions">
-                    {@render suggestionGroup("Products", groups.products, 0)}
+                    {@render suggestionGroup("Keywords", keywords, 0)}
+                    {@render suggestionGroup("Products", groups.products, keywords.length)}
                     {@render suggestionGroup(
                         "Shops",
                         groups.shops,
-                        groups.products.length,
+                        keywords.length + groups.products.length,
                     )}
                 </div>
             {:else}
@@ -220,7 +238,7 @@
                         ? "Searching…"
                         : phase === "error"
                           ? "Suggestions unavailable. Press Enter to search."
-                          : "No matching products or shops."}
+                          : "No matching suggestions."}
                 </p>
             {/if}
         </div>

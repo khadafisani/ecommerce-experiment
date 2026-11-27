@@ -10,7 +10,7 @@ pub(super) const INDEX: IndexDefinition = IndexDefinition {
         SELECT 'shop',id FROM shops WHERE TRUE
         ON DUPLICATE KEY UPDATE revision=revision+1,updated_at=CURRENT_TIMESTAMP(6)",
     select_jobs: "SELECT j.entity_id,j.revision,
-        CASE WHEN NOT s.suspended THEN JSON_OBJECT('id',s.id,'name',s.name) END AS document,NULL AS embedding
+        CASE WHEN NOT s.suspended THEN JSON_OBJECT('id',s.id,'name',s.name) END AS document
         FROM search_sync_jobs j LEFT JOIN shops s ON s.id=j.entity_id
         WHERE j.entity_type='shop' ORDER BY j.updated_at,j.entity_id LIMIT ?",
 };

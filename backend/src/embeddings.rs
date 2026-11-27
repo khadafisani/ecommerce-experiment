@@ -123,6 +123,26 @@ impl Embedder {
             .next()
             .filter(|vector| valid_vector(vector))
     }
+
+    pub async fn background_batch(
+        &self,
+        passages: Vec<String>,
+    ) -> anyhow::Result<Option<Vec<Vec<f32>>>> {
+        let Some(model) = self.0.as_ref().and_then(|value| value.get()) else {
+            return Ok(None);
+        };
+        let Ok(mut session) = Arc::clone(&model.session).try_lock_owned() else {
+            return Ok(None);
+        };
+        let count = passages.len();
+        let vectors =
+            tokio::task::spawn_blocking(move || session.embed(passages, Some(count))).await??;
+        anyhow::ensure!(
+            vectors.len() == count && vectors.iter().all(|vector| valid_vector(vector)),
+            "invalid canonical product embedding batch"
+        );
+        Ok(Some(vectors))
+    }
 }
 
 fn valid_vector(vector: &[f32]) -> bool {
@@ -251,7 +271,7 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
             tx.commit().await?;
             continue;
         }
-        let updated = sqlx::query(
+        sqlx::query(
             "UPDATE product_embeddings SET embedding=?,next_attempt_at=NULL
              WHERE product_id=? AND model=? AND fingerprint=? AND next_attempt_at IS NOT NULL",
         )
@@ -261,15 +281,6 @@ async fn publish(pool: &MySqlPool, embedder: &Embedder) -> anyhow::Result<bool> 
         .bind(&job.fingerprint)
         .execute(&mut *tx)
         .await?;
-        if updated.rows_affected() > 0 {
-            sqlx::query(
-                "INSERT INTO search_sync_jobs(entity_type,entity_id) VALUES ('product',?)
-                 ON DUPLICATE KEY UPDATE revision=revision+1,updated_at=CURRENT_TIMESTAMP(6)",
-            )
-            .bind(job.product_id)
-            .execute(&mut *tx)
-            .await?;
-        }
         tx.commit().await?;
     }
     connection.close().await?;
@@ -292,6 +303,9 @@ pub async fn worker(pool: MySqlPool, embedder: Embedder, recommendations: bool, 
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
+    }
+    if !recommendations {
+        return;
     }
     loop {
         let delay = match publish(&pool, &embedder).await {

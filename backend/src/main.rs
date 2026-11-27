@@ -384,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(uploads::PUBLIC_DIR).await?;
     tokio::fs::create_dir_all(uploads::PRIVATE_DIR).await?;
     tokio::spawn(search::index_worker(app.clone()));
+    tokio::spawn(search::cleanup_worker(app.clone()));
     tokio::spawn(commerce::expire_unpaid_checkouts(app.clone()));
     tokio::spawn(auth::prune_expired_challenges(app.db.clone()));
     if app.recommendations.enabled() {

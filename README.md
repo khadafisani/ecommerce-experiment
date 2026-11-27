@@ -109,7 +109,7 @@ Set `ALLOW_TEST_ACCOUNTS=true` only on the isolated local development backend to
 - Set `RECOMMENDATIONS_ENABLED=true` to enable **For you** in Explore products and related recommendations on product pages. The recommendations API accepts an optional `product_id` context, `category_id`, `shop_id`, `min_price`, `max_price`, and `sort` (`relevance`, `newest`, `price_asc`, or `price_desc`). Recommendation results are private and excluded from HTTP caching.
 - Each Axum process keeps a private Stoolap snapshot in its operating-system temporary directory. The snapshot includes up to 96 recent listings per category, up to 96 recent listings across the catalog, and up to 96 products from each of the sales and views leaderboards. Older products in a viewer's history can still inform ranking. The snapshot and rankings expire after 60 seconds. MariaDB checks current availability and price before returning cards and fills pages that have too few recommendations. Guest activity lives in the same browser for 30 days. Account view and cart signals are retained in MariaDB for 90 days.
 - On the storefront home, Explore products defaults to **For you**, which lists shopper preferences first, then products trending over the past seven days, then the rest of the catalog newest first. Shoppers can switch to **Newest** for chronological browsing. Guest views contribute to aggregate product counts without sending a browser identifier. The feed uses a signed cursor so shoppers can continue scrolling across backend replicas.
-- Set `SEMANTIC_SEARCH_ENABLED=true` to blend semantic and keyword results for products in autocomplete and submitted search. Product search uses keywords if the embedding model is unavailable or takes more than one second, including time spent waiting for the model. Shop search and explicit `suggest=true` requests use keywords. Either flag starts the local Multilingual E5 Small model and a worker that fills missing catalog embeddings. The Hugging Face cache can be prewarmed and specified with `HF_HOME`. Inspect startup logs for `local text embedder ready` and `product_embeddings.next_attempt_at` for pending backfill work.
+- Set `SEMANTIC_SEARCH_ENABLED=true` to enable E5 hybrid search for submitted queries when canonical keyword matches are weak. Autocomplete uses the shared keyword and shop indexes. Submitted queries use listing keyword search when the canonical index has no eligible results, including during the background backfill. Either feature flag starts the local Multilingual E5 Small model. The recommendations flag also enables the listing embedding worker. The Hugging Face cache can be prewarmed with `HF_HOME`. Inspect startup logs for `local text embedder ready`.
 - Set `EMBEDDINGS_DEVICE=directml` on Windows to generate up to 128 product embeddings per GPU batch. Each batch pads to its longest input. CPU mode is the default and processes up to eight products per batch. The backend uses CPU mode if DirectML initialization fails.
 - Leave Stoolap disabled by default while benchmarking. In a multi-pod deployment, use the same MariaDB URL, Meilisearch index suffix, and feature settings across replicas. Each pod builds its cache independently.
 
@@ -121,6 +121,31 @@ cargo test --release compare_hydrated_ranking_latency -- --ignored --nocapture
 ```
 
 ## Search indexes
+
+- Start the local GLiNER workers from `backend/` before starting the backend. Fastino GLiNER 2.5 is the default model. The backend tries `SEARCH_GLINER_URL` (GPU on `http://127.0.0.1:11439`) first and uses `SEARCH_GLINER_FALLBACK_URL` (CPU on `http://127.0.0.1:11435`) while the primary is unavailable. It retries the GPU after 30 seconds. Use an empty fallback URL for a single worker.
+- The keyword index doubles as the spelling dictionary. The catalog backfill builds it from active product and variant names, and the background worker keeps it updated. Submitted queries try catalog-backed corrections and known aliases before Fastino. A Fastino suggestion must match an active catalog keyword. Corrections preserve model numbers and offer details.
+- The shared keyword index stores compact phrases of up to eight words and 72 characters, with up to five validated typo aliases per phrase. Autocomplete matches the beginning of a keyword or alias. An alias needs at least three submitted searches within seven days. Accepted aliases are published on the canonical keyword, and their raw queue entries are removed. Other raw entries expire after seven days. Typing in the search box does not generate cleanup jobs.
+- The canonical product index stores one E5 vector per group when semantic search is enabled. The storefront reads the matching listing and price from MariaDB. Storage and condition constraints must match the same enabled variant. The listing and shop indexes still back storefront fallback and admin searches.
+
+```powershell
+py -3.12 -m venv "$env:LOCALAPPDATA\ToscaMarket\gliner"
+$glinerPython = "$env:LOCALAPPDATA\ToscaMarket\gliner\Scripts\python.exe"
+& $glinerPython -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+& $glinerPython -m pip install -r gliner-requirements.txt
+& $glinerPython gliner_worker.py
+```
+
+For the Fastino GPU worker, create a second environment with `torch==2.14.0+xpu` from `https://download.pytorch.org/whl/xpu` and the same `gliner-requirements.txt`. Run the GPU worker on port `11439` with `--device xpu --batch-size 16`. The CPU worker above serves as the fallback.
+
+For a trial, run the chosen GLiNER model in a separate terminal. The `/health` endpoint reports its model and device. To use a trial for queued extraction, set `SEARCH_GLINER_URL` to its loopback address before starting the backend.
+
+```powershell
+& $glinerPython gliner_worker.py --model gliner-community/gliner_small-v2.5 --port 11436
+& $glinerPython gliner_worker.py --model muchad/gliner-id --port 11437
+& $glinerPython gliner_worker.py --model urchade/gliner_multi-v2.1 --port 11438
+```
+
+To run on Intel Arc graphics on Windows, install `torch==2.14.0+xpu` from the PyTorch XPU wheel index at `https://download.pytorch.org/whl/xpu`, then start the worker with `--device xpu`. PyTorch 2.15.0 has an indexing regression on Meteor Lake and Arrow Lake integrated GPUs. [PyTorch issue](https://github.com/pytorch/pytorch/issues/201672)
 
 To use a new `MEILI_INDEX_SUFFIX`, stop the backend that serves that database, update `backend/.env`, and run `cargo run` from `backend/`. Startup creates missing indexes, applies the settings defined in `backend/src/search/products.rs` and `backend/src/search/shops.rs`, then backfills active products and nonsuspended shops from MariaDB. It waits for Meilisearch's tasks before opening the API port. If initialization fails, the startup error identifies the search setup step and pending changes stay queued for the next run.
 
