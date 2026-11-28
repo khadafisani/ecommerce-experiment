@@ -651,14 +651,18 @@ async fn publish(conn: &mut MySqlConnection, search: &Search) -> anyhow::Result<
             FROM search_catalog_sources s JOIN search_keyword_terms opt ON opt.id=s.keyword_id
             WHERE s.canonical_id=c.id AND s.variant_id>0) options
          FROM search_canonical_products c JOIN search_keyword_terms k ON k.id=c.keyword_id
-         WHERE c.dirty ORDER BY c.id LIMIT 128",
+         WHERE c.dirty=TRUE ORDER BY c.id LIMIT 128",
     ).fetch_all(&mut *conn).await?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+
     let mut documents = Vec::new();
     let mut deleted = Vec::new();
-    let mut ids = Vec::new();
+    let mut published = Vec::new();
     for row in &rows {
         if row.active {
-            ids.push(&row.id);
+            published.push(&row.id);
             documents.push(json!({
                 "id":row.id,"name":row.phrase,"brand":row.brand,"category":row.category,
                 "options":row.options.as_ref().map(|value| &value.0),
@@ -669,25 +673,34 @@ async fn publish(conn: &mut MySqlConnection, search: &Search) -> anyhow::Result<
         }
     }
     publish_documents(search, &search.canonical, &documents, &deleted).await?;
-    if !ids.is_empty() {
-        sqlx::query(
-            "UPDATE search_canonical_products SET dirty=FALSE
-             WHERE id IN (SELECT id FROM JSON_TABLE(?, '$[*]' COLUMNS(id CHAR(64) PATH '$')) ids)",
-        )
-        .bind(json!(ids).to_string())
-        .execute(&mut *conn)
-        .await?;
+
+    // Bind each ID so MariaDB can use the primary key for both batches.
+    for (sql, batch) in [
+        (
+            "UPDATE search_canonical_products SET dirty=FALSE WHERE id IN (",
+            &published,
+        ),
+        (
+            "DELETE FROM search_canonical_products WHERE id IN (",
+            &deleted,
+        ),
+    ] {
+        if batch.is_empty() {
+            continue;
+        }
+        let mut statement = QueryBuilder::<MySql>::new(sql);
+        let mut ids = statement.separated(",");
+        for id in batch {
+            ids.push_bind(id.as_str());
+        }
+        ids.push_unseparated(")");
+        statement
+            .build()
+            .persistent(false)
+            .execute(&mut *conn)
+            .await?;
     }
-    if !deleted.is_empty() {
-        sqlx::query(
-            "DELETE FROM search_canonical_products
-             WHERE id IN (SELECT id FROM JSON_TABLE(?, '$[*]' COLUMNS(id CHAR(64) PATH '$')) ids)",
-        )
-        .bind(json!(deleted).to_string())
-        .execute(&mut *conn)
-        .await?;
-    }
-    Ok(!rows.is_empty())
+    Ok(true)
 }
 
 pub(super) async fn publish_documents(

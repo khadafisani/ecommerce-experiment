@@ -131,11 +131,18 @@ cargo test --release compare_hydrated_ranking_latency -- --ignored --nocapture
 py -3.12 -m venv "$env:LOCALAPPDATA\ToscaMarket\gliner"
 $glinerPython = "$env:LOCALAPPDATA\ToscaMarket\gliner\Scripts\python.exe"
 & $glinerPython -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-& $glinerPython -m pip install -r gliner-requirements.txt
+& $glinerPython -m pip install -r gliner-common-requirements.txt
 & $glinerPython gliner_worker.py
 ```
 
-For the Fastino GPU worker, create a second environment with `torch==2.14.0+xpu` from `https://download.pytorch.org/whl/xpu` and the same `gliner-requirements.txt`. Run the GPU worker on port `11439` with `--device xpu --batch-size 16`. The CPU worker above serves as the fallback.
+For the Fastino GPU worker on Intel Arc, use a separate environment. The GPU requirements file installs the pinned XPU PyTorch build along with the shared GLiNER dependencies.
+
+```powershell
+py -3.12 -m venv "$env:LOCALAPPDATA\ToscaMarket\gliner-xpu"
+$glinerGpuPython = "$env:LOCALAPPDATA\ToscaMarket\gliner-xpu\Scripts\python.exe"
+& $glinerGpuPython -m pip install -r gliner-requirements.txt
+& $glinerGpuPython gliner_worker.py --device xpu --port 11439 --batch-size 16
+```
 
 For a trial, run the chosen GLiNER model in a separate terminal. The `/health` endpoint reports its model and device. To use a trial for queued extraction, set `SEARCH_GLINER_URL` to its loopback address before starting the backend.
 
@@ -145,7 +152,7 @@ For a trial, run the chosen GLiNER model in a separate terminal. The `/health` e
 & $glinerPython gliner_worker.py --model urchade/gliner_multi-v2.1 --port 11438
 ```
 
-To run on Intel Arc graphics on Windows, install `torch==2.14.0+xpu` from the PyTorch XPU wheel index at `https://download.pytorch.org/whl/xpu`, then start the worker with `--device xpu`. PyTorch 2.15.0 has an indexing regression on Meteor Lake and Arrow Lake integrated GPUs. [PyTorch issue](https://github.com/pytorch/pytorch/issues/201672)
+The GPU requirements pin PyTorch 2.14.0 because 2.15.0 has an indexing regression on Meteor Lake and Arrow Lake integrated GPUs. [PyTorch issue](https://github.com/pytorch/pytorch/issues/201672)
 
 To use a new `MEILI_INDEX_SUFFIX`, stop the backend that serves that database, update `backend/.env`, and run `cargo run` from `backend/`. Startup creates missing indexes, applies the settings defined in `backend/src/search/products.rs` and `backend/src/search/shops.rs`, then backfills active products and nonsuspended shops from MariaDB. It waits for Meilisearch's tasks before opening the API port. If initialization fails, the startup error identifies the search setup step and pending changes stay queued for the next run.
 

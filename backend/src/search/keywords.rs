@@ -1,4 +1,8 @@
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeSet, HashMap},
+    time::Duration,
+};
 
 use meilisearch_sdk::{
     errors::{Error as MeiliError, ErrorCode},
@@ -8,20 +12,21 @@ use meilisearch_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{MySqlConnection, MySqlPool};
+use sqlx::{MySql, MySqlConnection, MySqlPool, QueryBuilder};
 
 use super::{
     Search, canonical,
     extractor::{Extractor, Task},
     settings_match, wait_for_task,
 };
-use crate::json;
+use crate::{embeddings, json};
 
 pub(super) const INDEX: &str = "tosca_market_keywords_v1";
 const MAX_ALIASES: usize = 5;
 const MIN_ALIAS_SEARCHES: u64 = 3;
 const MAX_SUGGESTION_CHARS: usize = 72;
 const MAX_SUGGESTION_WORDS: usize = 8;
+const SEMANTIC_CANDIDATES: usize = 32;
 
 pub(super) fn settings() -> Settings {
     Settings::new()
@@ -144,8 +149,9 @@ pub(super) async fn suggest(search: &Search, query: &str) -> Vec<Hit> {
         .with_limit(24)
         .with_matching_strategy(MatchingStrategies::ALL)
         .with_attributes_to_retrieve(Selectors::Some(FIELDS))
-        .with_show_matches_position(true);
-    match request.execute::<Hit>().await {
+        .with_show_matches_position(true)
+        .with_show_ranking_score(true);
+    let lexical: Vec<_> = match request.execute::<Hit>().await {
         Ok(result) => result
             .hits
             .into_iter()
@@ -154,13 +160,79 @@ pub(super) async fn suggest(search: &Search, query: &str) -> Vec<Hit> {
                     && leading_match(hit.matches_position.as_ref(), FIELDS)
             })
             .take(6)
-            .map(|hit| hit.result)
             .collect(),
         Err(error) => {
             tracing::debug!(%error, "keyword suggestions unavailable");
             Vec::new()
         }
+    };
+    if search.hybrid
+        && !lexical
+            .iter()
+            .any(|hit| hit.ranking_score.is_some_and(|score| score >= 0.85))
+    {
+        let normalized = normalize(query);
+        if normalized.chars().count() >= 3
+            && let Ok(suggestions) = tokio::time::timeout(
+                Duration::from_millis(750),
+                semantic_suggestions(search, &normalized),
+            )
+            .await
+            && !suggestions.is_empty()
+        {
+            return suggestions;
+        }
     }
+    lexical.into_iter().map(|hit| hit.result).collect()
+}
+
+async fn semantic_suggestions(search: &Search, query: &str) -> Vec<Hit> {
+    #[derive(Deserialize)]
+    struct CategoryHit {
+        category: String,
+    }
+
+    let Some(vector) = search.embedder.query(query).await else {
+        return Vec::new();
+    };
+    let mut request = search.canonical.search();
+    request
+        .with_limit(SEMANTIC_CANDIDATES)
+        .with_attributes_to_retrieve(Selectors::Some(&["category"]))
+        .with_hybrid(embeddings::MODEL, 1.0)
+        .with_vector(&vector)
+        .with_ranking_score_threshold(0.85);
+    match request.execute::<CategoryHit>().await {
+        Ok(result) => suggested_categories(result.hits.into_iter().map(|hit| hit.result.category)),
+        Err(error) => {
+            tracing::debug!(%error, "semantic keyword suggestions unavailable");
+            Vec::new()
+        }
+    }
+}
+
+fn suggested_categories(categories: impl IntoIterator<Item = String>) -> Vec<Hit> {
+    let mut counts = HashMap::new();
+    for category in categories {
+        if compact_phrase(&category) {
+            *counts.entry(category).or_insert(0) += 1;
+        }
+    }
+    let mut supported: Vec<_> = counts
+        .into_iter()
+        .filter(|(_, count)| *count >= SEMANTIC_CANDIDATES / 4)
+        .collect();
+    // Require agreement across most neighbors before suggesting a category.
+    if supported.iter().map(|(_, count)| count).sum::<usize>() < SEMANTIC_CANDIDATES * 3 / 4 {
+        return Vec::new();
+    }
+    supported.sort_unstable_by(|(a, a_count), (b, b_count)| {
+        (Reverse(*a_count), a).cmp(&(Reverse(*b_count), b))
+    });
+    supported
+        .into_iter()
+        .map(|(phrase, _)| Hit { phrase })
+        .collect()
 }
 
 pub(super) async fn correction(search: &Search, query: &str) -> Option<String> {
@@ -490,15 +562,17 @@ pub(super) async fn publish(conn: &mut MySqlConnection, search: &Search) -> anyh
     let rows: Vec<KeywordDocument> = sqlx::query_as(
         "SELECT k.id,k.phrase,k.demand,k.aliases,
          EXISTS(SELECT 1 FROM search_catalog_sources s WHERE s.keyword_id=k.id) active
-         FROM search_keyword_terms k WHERE dirty ORDER BY id LIMIT 256",
+         FROM search_keyword_terms k WHERE k.dirty=TRUE ORDER BY k.id LIMIT 256",
     )
     .fetch_all(&mut *conn)
     .await?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+
     let mut documents = Vec::new();
     let mut deleted = Vec::new();
-    let mut ids = Vec::new();
     for row in &rows {
-        ids.push(&row.id);
         if row.active && compact_phrase(&row.phrase) {
             let aliases: Vec<_> = row.aliases.0.iter().map(|alias| &alias.phrase).collect();
             documents.push(
@@ -509,21 +583,55 @@ pub(super) async fn publish(conn: &mut MySqlConnection, search: &Search) -> anyh
         }
     }
     super::canonical::publish_documents(search, &search.keywords, &documents, &deleted).await?;
-    if !ids.is_empty() {
-        sqlx::query(
-            "UPDATE search_keyword_terms SET dirty=FALSE
-             WHERE id IN (SELECT id FROM JSON_TABLE(?, '$[*]' COLUMNS(id CHAR(64) PATH '$')) ids)",
-        )
-        .bind(json!(ids).to_string())
-        .execute(conn)
-        .await?;
+
+    // A bound ID list lets MariaDB use the primary key for this batch.
+    let mut update =
+        QueryBuilder::<MySql>::new("UPDATE search_keyword_terms SET dirty=FALSE WHERE id IN (");
+    let mut ids = update.separated(",");
+    for row in &rows {
+        ids.push_bind(&row.id);
     }
-    Ok(!rows.is_empty())
+    ids.push_unseparated(")");
+    update.build().persistent(false).execute(conn).await?;
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_suggestions_require_category_agreement() {
+        let clothing = [
+            ("Men's Clothing", 16),
+            ("Girls' Clothing", 15),
+            ("Men's Shoes", 1),
+        ];
+        let suggestions = suggested_categories(
+            clothing
+                .into_iter()
+                .flat_map(|(category, count)| std::iter::repeat_n(category.to_owned(), count)),
+        );
+        let phrases: Vec<_> = suggestions.into_iter().map(|hit| hit.phrase).collect();
+        assert_eq!(phrases, ["Men's Clothing", "Girls' Clothing"]);
+
+        let scattered = [
+            ("Men's Clothing", 12),
+            ("Men's Shoes", 8),
+            ("Men's Accessories", 4),
+            ("Girls' Clothing", 3),
+            ("Video Games", 3),
+            ("Suitcases", 2),
+        ];
+        assert!(
+            suggested_categories(
+                scattered.into_iter().flat_map(|(category, count)| {
+                    std::iter::repeat_n(category.to_owned(), count)
+                })
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn typo_correction_preserves_product_details() {
